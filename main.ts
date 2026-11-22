@@ -11,7 +11,7 @@
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 // Serve the game for playtesting with `node serve.ts` (http://localhost:8080).
 
-import { cpSync, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -55,3 +55,12 @@ if (dossierBytes > DOSSIER_WARN_BYTES) {
     `WARNING: dossier is ${dossierBytes} bytes, over the ${DOSSIER_WARN_BYTES} byte budget — shrink the screenshots before submitting.`,
   );
 }
+
+// A short build summary so a failed or half-copied output is obvious at a
+// glance instead of only surfacing later at the scorer.
+const shotNames = existsSync(join(outputDir, 'screenshots'))
+  ? readdirSync(join(outputDir, 'screenshots'))
+  : [];
+console.log(
+  `entry ready in ${outputDir}: ${shotNames.length} screenshot(s) (${shotNames.join(', ') || 'none'})`,
+);
