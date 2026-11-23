@@ -553,8 +553,11 @@ function spawnCar(type, x, y, opts) {
   }
   // A maker that answers with non-numeric coordinates is discarded
   // in favour of the known-good factory, whatever it did.
+  // NOTE the two factories disagree on argument order: the vehicles
+  // module's createCar is (type, x, y), but the traffic module's
+  // createCar imported above is (x, y, type) — keep them straight.
   if (!car || typeof car.x !== 'number' || typeof car.y !== 'number') {
-    car = createCar(type, x, y, options);
+    car = createCar(x, y, type, options);
   }
   if (car && options.cruise !== undefined) car.cruise = options.cruise;
   if (car && options.isCourier) car.isCourier = true;
