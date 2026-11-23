@@ -1,111 +1,113 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Crescent Bay — an open-world crime game</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crescent Bay — Open-World Crime Game</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%232471a3'/%3E%3Ccircle cx='16' cy='16' r='9' fill='%23f1c40f'/%3E%3C/svg%3E">
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0e1a; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #f2f2f2; }
-  #game-canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
-
-  .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(5, 8, 20, 0.72); z-index: 10; }
-  .overlay.hidden { display: none; }
-  .panel { background: rgba(16, 20, 38, 0.96); border: 2px solid #2e4a6b; border-radius: 12px; padding: 28px 32px; max-width: 560px; width: min(92vw, 560px); box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6); }
-  .panel h1 { font-size: 44px; letter-spacing: 2px; color: #ffd640; text-transform: uppercase; }
-  .panel h2 { font-size: 26px; color: #ffd640; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
-  .panel p { margin: 10px 0; line-height: 1.5; color: #d8dce8; }
-  .subtitle { color: #7fe3c0; font-weight: 600; margin-bottom: 18px; }
-  .panel button { display: block; width: 100%; margin: 8px 0; padding: 12px 16px; font-size: 17px; font-weight: 700; color: #0b0e1a; background: #ffd640; border: none; border-radius: 8px; cursor: pointer; }
-  .panel button:hover { background: #ffe14d; }
-  .panel button.secondary { background: #2e4a6b; color: #f2f2f2; }
-  .panel button.secondary:hover { background: #3a5a80; }
-
-  #save-slots { margin: 14px 0; }
-  .save-slot { display: block; width: 100%; margin: 6px 0; padding: 10px 12px; font-size: 15px; text-align: left; color: #f2f2f2; background: #232a44; border: 1px solid #3a4a6b; border-radius: 6px; cursor: pointer; }
-  .save-slot:hover { background: #2c3554; }
-
-  #controls-list { margin: 14px 0 4px; padding: 12px 14px; background: rgba(255, 255, 255, 0.05); border-radius: 8px; font-size: 14px; line-height: 1.9; list-style: none; }
-  #controls-list li b { color: #ffd640; }
-
-  #radio-station { position: fixed; top: 12px; right: 220px; z-index: 5; font-size: 15px; font-weight: 700; color: #7fe3c0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8); pointer-events: none; }
-
-  #mission-dialog .panel { border-color: #ffd640; }
-  #dialog-fixer { color: #7fe3c0; font-size: 20px; font-weight: 800; }
-  #dialog-text { font-size: 17px; }
-
-  .garage-row { margin: 10px 0; }
-  .garage-row button { width: auto; display: inline-block; margin: 4px 6px 4px 0; padding: 8px 12px; font-size: 15px; }
-  .paint-swatch { width: 34px; height: 34px; border-radius: 50%; border: 2px solid #fff; padding: 0; }
-  #garage-cash { font-weight: 800; color: #ffd640; }
-
-  #game-over-title { font-size: 52px; color: #ff4d4d; letter-spacing: 4px; }
-  .hint { font-size: 13px; color: #9aa3b8; margin-top: 12px; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10182a; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #game-root { position: fixed; inset: 0; }
+  #game { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(8, 12, 26, 0.55); color: #f2f2f2; z-index: 10; }
+  .overlay[hidden] { display: none; }
+  .panel { max-width: 560px; width: calc(100% - 48px); padding: 28px 32px; background: rgba(10, 16, 34, 0.88); border: 2px solid #c9a227; border-radius: 12px; box-shadow: 0 12px 48px rgba(0,0,0,0.6); text-align: center; }
+  .panel h1 { margin: 0 0 4px; font-size: 52px; letter-spacing: 4px; color: #f1c40f; text-shadow: 0 3px 0 #7a5a00, 0 6px 18px rgba(0,0,0,0.7); }
+  .panel h2 { margin: 0 0 12px; font-size: 26px; letter-spacing: 2px; color: #f1c40f; }
+  .panel .tagline { margin: 0 0 18px; color: #9fd8ff; font-size: 15px; }
+  .panel .features { margin: 0 0 18px; color: #d8d8d8; font-size: 14px; line-height: 1.5; }
+  .panel p { margin: 8px 0; line-height: 1.5; }
+  .menu-buttons { display: flex; flex-direction: column; gap: 10px; margin: 16px 0; }
+  .menu-buttons button, .panel button { padding: 12px 22px; font-size: 17px; font-weight: 700; letter-spacing: 1px; color: #10182a; background: #f1c40f; border: none; border-radius: 8px; cursor: pointer; }
+  .menu-buttons button:hover, .panel button:hover { background: #ffd94d; }
+  .menu-buttons button.secondary { background: #2471a3; color: #fff; }
+  .menu-buttons button.secondary:hover { background: #2e86c1; }
+  .menu-buttons button:disabled { background: #555; color: #999; cursor: default; }
+  #save-slots { list-style: none; margin: 0 0 14px; padding: 0; text-align: left; }
+  #save-slots li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; margin: 4px 0; background: rgba(255,255,255,0.07); border-radius: 6px; font-size: 14px; }
+  #save-slots li button { padding: 4px 12px; font-size: 13px; }
+  #controls-list { text-align: left; font-size: 14px; line-height: 1.7; margin: 12px auto 4px; display: inline-block; }
+  #controls-list kbd { background: #2c3e50; border: 1px solid #5d6d7e; border-radius: 4px; padding: 1px 7px; font-family: inherit; font-weight: 700; }
+  #mission-dialog { position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%); width: min(620px, calc(100% - 32px)); z-index: 11; }
+  #mission-dialog[hidden] { display: none; }
+  #mission-dialog .dialog-box { background: rgba(10, 16, 34, 0.92); border: 2px solid #c9a227; border-radius: 10px; padding: 16px 20px; color: #f2f2f2; }
+  #mission-dialog .dialog-fixer { color: #f1c40f; font-weight: 700; letter-spacing: 1px; margin-bottom: 4px; }
+  #mission-dialog .dialog-text { line-height: 1.5; margin: 4px 0 12px; }
+  #mission-dialog .dialog-actions { display: flex; gap: 10px; }
+  #mission-dialog button { padding: 9px 18px; font-size: 15px; font-weight: 700; color: #10182a; background: #f1c40f; border: none; border-radius: 7px; cursor: pointer; }
+  #mission-dialog button.ghost { background: transparent; color: #f2f2f2; border: 1px solid #888; }
+  #game-over-title { font-size: 44px; letter-spacing: 6px; color: #ff5a4e; margin: 0 0 8px; text-shadow: 0 3px 0 #5a0e08; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 </style>
 </head>
 <body>
-<canvas id="game-canvas"></canvas>
-<div id="radio-station">♪ Bay FM</div>
+<div id="game-root">
+  <canvas id="game" aria-label="Crescent Bay: drive, chase and escape across an open-world city"></canvas>
 
-<!-- Title screen: New Game + 3 save slots + controls -->
-<div id="title-screen" class="overlay">
-  <div class="panel">
-    <h1>Crescent Bay</h1>
-    <p class="subtitle">An open-world crime game — play as Rook, run jobs for Mara and Dex, and stay ahead of the Crescent Bay police.</p>
-    <button id="new-game-btn">New Game</button>
-    <div id="save-slots"></div>
-    <ul id="controls-list">
-      <li><b>WASD / Arrows</b> — move on foot, drive</li>
-      <li><b>Mouse</b> — aim &nbsp;·&nbsp; <b>Click</b> — shoot</li>
-      <li><b>Shift</b> — sprint &nbsp;·&nbsp; <b>E</b> — enter car / accept / garage</li>
-      <li><b>1 / 2 / 3</b> — pistol / SMG / shotgun &nbsp;·&nbsp; <b>Q</b> — cycle weapon</li>
-      <li><b>R</b> — radio station &nbsp;·&nbsp; <b>P</b> — pause &nbsp;·&nbsp; <b>M</b> — mute</li>
-    </ul>
-    <p class="hint">Free roam, 12 story missions, wanted stars, a police helicopter, a garage that sells upgrades, three radio stations and three save slots. No network, no downloads — everything runs from these files.</p>
+  <!-- Title screen: a translucent DOM overlay over the living city. -->
+  <div id="title-screen" class="overlay">
+    <div class="panel">
+      <h1>CRESCENT BAY</h1>
+      <p class="tagline">An open-world crime story. You are Rook. The city is yours — if you can keep it.</p>
+      <p class="features">12 missions &bull; Wanted 1&ndash;5 stars &bull; Police helicopter &bull; Traffic &amp; pedestrians &bull; Steal any car &bull; Fixer Garage upgrades &bull; 3 radio stations &bull; Day &amp; night &bull; 3 save slots</p>
+      <ul id="save-slots" aria-label="Save slots">
+        <li><span>Slot 1 — Empty</span><button data-slot="1" disabled>Continue</button></li>
+        <li><span>Slot 2 — Empty</span><button data-slot="2" disabled>Continue</button></li>
+        <li><span>Slot 3 — Empty</span><button data-slot="3" disabled>Continue</button></li>
+      </ul>
+      <div class="menu-buttons">
+        <button id="new-game-btn" type="button">New Game</button>
+        <button id="continue-btn" type="button" class="secondary">Continue</button>
+      </div>
+      <div id="controls-list" aria-label="Controls">
+        <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrows — move &amp; drive &nbsp; <kbd>Shift</kbd> — sprint</div>
+        <div>Mouse — aim &nbsp; Click — shoot &nbsp; <kbd>E</kbd> — enter car / accept / garage</div>
+        <div><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> — weapons &nbsp; <kbd>Q</kbd> — cycle weapon &nbsp; <kbd>R</kbd> — radio</div>
+        <div><kbd>Space</kbd> — handbrake &nbsp; <kbd>Esc</kbd> / <kbd>P</kbd> — pause</div>
+      </div>
+    </div>
   </div>
-</div>
 
-<!-- Pause menu -->
-<div id="pause-menu" class="overlay hidden">
-  <div class="panel">
-    <h2>Paused</h2>
-    <p>Rook waits. The city does not.</p>
-    <button id="resume-btn">Resume</button>
-    <button id="save-btn" class="secondary">Save to active slot</button>
-    <button id="quit-btn" class="secondary">Quit to title</button>
+  <!-- Pause menu -->
+  <div id="pause-menu" class="overlay" hidden>
+    <div class="panel">
+      <h2>PAUSED</h2>
+      <p>Crescent Bay waits for no one — except right now.</p>
+      <div class="menu-buttons">
+        <button id="resume-btn" type="button">Resume</button>
+        <button id="save-btn" type="button" class="secondary">Save Game</button>
+        <button id="quit-to-title-btn" type="button" class="secondary">Quit to Title</button>
+      </div>
+    </div>
   </div>
-</div>
 
-<!-- Game over -->
-<div id="game-over-screen" class="overlay hidden">
-  <div class="panel">
-    <h2 id="game-over-title">DOWN</h2>
-    <p id="game-over-text">Rook is down.</p>
-    <button id="retry-btn">Retry the mission</button>
-    <button id="quit-btn-2" class="secondary">Quit to title</button>
+  <!-- Game over: CAUGHT (arrested) or DOWN (health gone). -->
+  <div id="game-over-screen" class="overlay" hidden>
+    <div class="panel">
+      <h2 id="game-over-title">CAUGHT</h2>
+      <p id="game-over-text">The police took Rook in. The city keeps moving.</p>
+      <p id="game-over-stats"></p>
+      <div class="menu-buttons">
+        <button id="respawn-btn" type="button">Back on the Streets</button>
+        <button id="game-over-title-btn" type="button" class="secondary">Title Screen</button>
+      </div>
+    </div>
   </div>
-</div>
 
-<!-- Mission dialog -->
-<div id="mission-dialog" class="overlay hidden">
-  <div class="panel">
-    <h2 id="dialog-fixer">Mara</h2>
-    <p id="dialog-text"></p>
-    <button id="dialog-accept">Accept (E)</button>
-    <button id="dialog-decline" class="secondary">Not now</button>
+  <!-- Fixer mission dialog -->
+  <div id="mission-dialog" hidden>
+    <div class="dialog-box">
+      <div class="dialog-fixer" id="dialog-fixer">Mara</div>
+      <div class="dialog-text" id="dialog-text"></div>
+      <div class="dialog-actions">
+        <button id="mission-accept-btn" type="button">Accept (E)</button>
+        <button id="mission-decline-btn" type="button" class="ghost">Not Now</button>
+      </div>
+    </div>
   </div>
-</div>
 
-<!-- Fixer Garage upgrade menu -->
-<div id="garage-menu" class="overlay hidden">
-  <div class="panel">
-    <h2>Fixer Garage</h2>
-    <p id="garage-cash">Cash: $0</p>
-    <div id="garage-upgrades"></div>
-    <button id="garage-close" class="secondary">Close</button>
-  </div>
+  <p id="status" role="status" aria-live="polite"></p>
 </div>
-
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>
