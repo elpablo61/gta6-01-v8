@@ -50,6 +50,13 @@ import * as Helicopter from './helicopter.js';
 import * as Radio from './radio.js';
 import * as SaveMod from './save.js';
 import * as Weapons from './weapons.js';
+import * as Traffic from './traffic.js';
+import * as Pedestrians from './pedestrians.js';
+import * as Combat from './combat.js';
+import * as PlayerMod from './player.js';
+import * as Autopilot from './autopilot.js';
+import * as Hud from './hud.js';
+import * as LivingCity from './living-city.js';
 
 // Call the first hook a module exposes, with the given arguments.
 // Returns the hook's value, or undefined when the module exposes none
@@ -157,6 +164,426 @@ function newGameState() {
 export const game = newGameState();
 
 // ---------------------------------------------------------------------------
+// G/H module wiring (finisher) — one shared context object `gctx` that
+// carries every field the Builder G factories (createX(G)) and the
+// Builder H systems (world.*) need. Instances are created in
+// wireGModules() after buildWorld(), so factories see the real city.
+// ---------------------------------------------------------------------------
+
+let gctx = null;
+let gAudio = null;
+let gTraffic = null;
+let gPeds = null;
+let gCombat = null;
+let gPlayer = null;
+let gAutopilot = null;
+let gHud = null;
+let gHeli = null;
+let gGarage = null;
+let gWeapons = null;
+let gSave = null;
+let gPoliceDept = null;
+let gWanted = null;
+let gCourierCar = null; // m2 chase target (a live traffic car)
+let gSyncedCrates = new Set();
+let gCombatWrapped = null; // proxy: applies fire() hit records as damage
+
+// combat.fire() RETURNS hit records ({target, damage, x, y, killed})
+// but applies no damage itself — the caller must. Every fire path
+// (player module, autopilot, main's shootWeapon) goes through here.
+function applyCombatHits(hits) {
+  if (!hits || !hits.length) return;
+  for (const hit of hits) {
+    const t = hit.target || hit.enemy;
+    if (!t || typeof t.hp !== 'number') continue;
+    t.hp -= hit.damage || 0;
+    try { sfx('hit'); } catch (err) { /* sfx is best-effort */ }
+    game.particles.push({
+      x: hit.x !== undefined ? hit.x : t.x,
+      y: hit.y !== undefined ? hit.y : t.y,
+      color: '#ff6b5e', size: 6, life: 0.5,
+    });
+    if (t.hp <= 0) {
+      const i = game.enemies.indexOf(t);
+      if (i >= 0) game.enemies.splice(i, 1);
+      game.player.cash += 50;
+      if (typeof Act2.act2OnEnemyDown === 'function' && isAct2Mission(game.missionId)) {
+        try { Act2.act2OnEnemyDown(game, t); } catch (err) { /* best-effort */ }
+      }
+    }
+  }
+}
+
+function fireCombat(ox, oy, angle, targets) {
+  if (!gCombat || typeof gCombat.fire !== 'function') return [];
+  let hits = [];
+  try {
+    hits = gCombat.fire(ox, oy, angle, targets) || [];
+  } catch (err) {
+    return [];
+  }
+  applyCombatHits(hits);
+  return hits;
+}
+
+function makeCombatWrapper(combat) {
+  if (!combat) return null;
+  const wrappedFire = (ox, oy, angle, targets) => fireCombat(ox, oy, angle, targets);
+  return new Proxy(combat, {
+    get(target, prop) {
+      if (prop === 'fire') return wrappedFire;
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
+function instantiate(module, factoryNames, ctx) {
+  if (!module) return null;
+  for (const name of factoryNames) {
+    const fn = module[name];
+    if (typeof fn === 'function') {
+      try {
+        const inst = ctx === undefined ? fn() : fn(ctx);
+        return inst === undefined ? null : inst;
+      } catch (err) {
+        console.warn('[wiring] factory ' + name + ' failed:', err && err.message);
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function callInstance(inst, names, ...args) {
+  if (!inst) return false;
+  for (const name of names) {
+    const fn = inst[name];
+    if (typeof fn === 'function') {
+      fn.apply(inst, args);
+      return true;
+    }
+  }
+  return false;
+}
+
+function minimapPoints() {
+  const pts = [];
+  if (game.objective) pts.push({ x: game.objective.x, y: game.objective.y, kind: 'objective', label: game.objective.text || 'Objective' });
+  for (const cop of game.police) pts.push({ x: cop.x, y: cop.y, kind: 'police' });
+  const shop = World.LANDMARKS.sprayShop;
+  pts.push({ x: shop.x, y: shop.y, kind: 'spray' });
+  const garage = World.LANDMARKS.fixerGarage;
+  pts.push({ x: garage.x, y: garage.y, kind: 'garage' });
+  return pts;
+}
+
+function buildGContext() {
+  const ctx = {
+    game,
+    get player() { return game.player; },
+    get world() { return game.world; },
+    get cars() { return game.cars; },
+    get pedestrians() { return game.pedestrians; },
+    get bullets() { return game.bullets; },
+    get pickups() { return game.pickups; },
+    get enemies() { return game.enemies; },
+    get police() { return game.police; },
+    get traffic() { return gTraffic; },
+    get combat() { return gCombatWrapped || gCombat; },
+    get autopilot() { return gAutopilot; },
+    get helicopter() {
+      return {
+        get active() { return gHeli ? !!gHeli.active : !!game.helicopter; },
+        get spotlightOnPlayer() { return gHeli ? !!gHeli.spotOn : false; },
+        get x() { return game.helicopter ? game.helicopter.x : 0; },
+        get y() { return game.helicopter ? game.helicopter.y : 0; },
+        get spotlightX() { return game.helicopter ? game.helicopter.spotlightX : undefined; },
+        get spotlightY() { return game.helicopter ? game.helicopter.spotlightY : undefined; },
+      };
+    },
+    get garage() {
+      return {
+        get x() { return World.LANDMARKS.fixerGarage.x; },
+        get y() { return World.LANDMARKS.fixerGarage.y; },
+        open: () => openGarageMenu(),
+        buyCheapest: () => buyCheapestUpgrade(),
+        close: () => closeGarageMenu(),
+      };
+    },
+    get sprayShop() { return { x: World.LANDMARKS.sprayShop.x, y: World.LANDMARKS.sprayShop.y }; },
+    get courier() {
+      // The autopilot's chase steering aims at this, NOT at the
+      // setObjective point — so a phantom fallback point (the old
+      // 1500,1500) would send it parking next to nothing. With no
+      // courier, report the player's own position so it idles.
+      // LEAD the courier by 120px along its heading: pure pursuit of
+      // the courier's current position makes the car orbit behind a
+      // moving target forever (it slows near the target and never
+      // closes); aiming ahead intercepts it.
+      return {
+        get x() {
+          if (!gCourierCar) return game.player.x;
+          const a = gCourierCar.angle || 0;
+          return gCourierCar.x + Math.cos(a) * 120;
+        },
+        get y() {
+          if (!gCourierCar) return game.player.y;
+          const a = gCourierCar.angle || 0;
+          return gCourierCar.y + Math.sin(a) * 120;
+        },
+        get car() { return gCourierCar; },
+      };
+    },
+    get dialogOpen() { return game.state === 'dialog'; },
+    get audio() { return gAudio; },
+    get wanted() { return gWanted; },
+    get policeDept() { return gPoliceDept; },
+    combatTargets: () => game.enemies,
+    targets: () => game.enemies,
+    minimap: { points: () => minimapPoints() },
+    minimapPoints: () => minimapPoints(),
+    wantedStars: () => game.stars,
+    get garageX() { return World.LANDMARKS.fixerGarage.x; },
+    get garageY() { return World.LANDMARKS.fixerGarage.y; },
+    playerCar: () => game.player.car,
+    get cash() { return game.player.cash; },
+    set cash(v) { game.player.cash = v; },
+    addCash: (n) => { game.player.cash += n; },
+    setPaused: (b) => {
+      if (b) { game.state = 'paused'; }
+      else if (game.state === 'paused') { game.state = 'playing'; }
+    },
+    setObjective: (obj) => setArcObjective(obj),
+    addHeat: (n) => addHeat(n),
+    get input() { return input; },
+    spots: [
+      { x: World.LANDMARKS.gunStore.x, y: World.LANDMARKS.gunStore.y, weapon: 'smg' },
+      { x: World.LANDMARKS.docks.x, y: World.LANDMARKS.docks.y, weapon: 'shotgun' },
+      { x: World.LANDMARKS.hideout.x, y: World.LANDMARKS.hideout.y, weapon: 'smg' },
+    ],
+  };
+  return ctx;
+}
+
+// Attach the collision + world helpers the G/H contracts expect onto
+// the live world object (runtime wiring, not a source edit).
+function attachWorldHelpers() {
+  const w = game.world;
+  if (!w || w.__crescentWired) return;
+  w.__crescentWired = true;
+  w.collide = (x, y, r) => World.clampToWorld(x, y, r === undefined ? 24 : r);
+  Object.defineProperty(w, 'player', { get: () => game.player, configurable: true });
+  w.wantedStars = () => game.stars;
+  Object.defineProperty(w, 'garageX', { get: () => World.LANDMARKS.fixerGarage.x, configurable: true });
+  Object.defineProperty(w, 'garageY', { get: () => World.LANDMARKS.fixerGarage.y, configurable: true });
+  w.playerCar = () => game.player.car;
+  Object.defineProperty(w, 'cash', {
+    get: () => game.player.cash, set: (v) => { game.player.cash = v; }, configurable: true,
+  });
+  w.addCash = (n) => { game.player.cash += n; };
+  w.setPaused = (b) => {
+    if (b) { game.state = 'paused'; }
+    else if (game.state === 'paused') { game.state = 'playing'; }
+  };
+}
+
+// Link the player module's state object as game.player (single source
+// of truth), carrying over cash + weapons from main's player state.
+function linkPlayerState() {
+  if (!gPlayer || !gPlayer.state) return;
+  const st = gPlayer.state;
+  const cur = game.player;
+  if (cur && cur !== st) {
+    if (typeof st.cash === 'number' && cur.cash) st.cash = cur.cash;
+    st.weapons = cur.weapons || st.weapons;
+    st.currentWeapon = cur.currentWeapon || st.currentWeapon || 'pistol';
+    st.weaponName = cur.weaponName || st.weaponName;
+    st.ammo = cur.ammo === undefined ? st.ammo : cur.ammo;
+    st.fireCooldown = cur.fireCooldown || 0;
+    st.color = cur.color || st.color;
+    st.maxHealth = cur.maxHealth || st.maxHealth || 100;
+    if (typeof st.health !== 'number') st.health = cur.health || 100;
+    // Position + vitals come from main's player state (hideout start,
+    // load-slot restores, new-game resets) — the module starts at its
+    // own default and must adopt main's spawn point.
+    st.x = cur.x;
+    st.y = cur.y;
+    st.angle = cur.angle || 0;
+    st.speed = 0;
+    st.health = cur.health || 100;
+    st.onFoot = cur.onFoot !== false;
+    st.car = cur.car || null;
+  }
+  game.player = st;
+}
+
+// Re-expose the wired instances + autopilot hook on the playtest
+// handle. Called from wireGModules() and again in boot(), after the
+// window.__crescentBay literal is assigned (which would wipe them).
+function exposeWiring() {
+  if (typeof window === 'undefined') return;
+  window.__crescentBay = window.__crescentBay || {};
+  if (gAutopilot) {
+    window.__crescentBay.autopilot = (gm, dt, inp) => {
+      let drove = false;
+      try {
+        const out = typeof gAutopilot.update === 'function' ? gAutopilot.update(dt) : null;
+        const inputObj = out || gAutopilot.input;
+        if (gAutopilot.active && inputObj) {
+          drove = !!(inputObj.up || inputObj.down || inputObj.left || inputObj.right ||
+            inputObj.interact || inputObj.shoot || inputObj.sprint);
+        }
+      } catch (err) {
+        console.warn('[autopilot]', err && err.message);
+      }
+      return drove;
+    };
+  }
+  window.__crescentBay._modules = {
+    audio: gAudio, traffic: gTraffic, pedestrians: gPeds, combat: gCombatWrapped || gCombat,
+    player: gPlayer, autopilot: gAutopilot, hud: gHud, helicopter: gHeli,
+    garage: gGarage, weapons: gWeapons, save: gSave,
+    policeDept: gPoliceDept, wanted: gWanted, context: gctx,
+  };
+  window.__crescentBay._wired = {
+    audio: !!gAudio, traffic: !!gTraffic, pedestrians: !!gPeds, combat: !!gCombat,
+    player: !!gPlayer, autopilot: !!gAutopilot, hud: !!gHud, helicopter: !!gHeli,
+    garage: !!gGarage, weapons: !!gWeapons, save: !!gSave,
+    policeDept: !!gPoliceDept, wanted: !!gWanted,
+  };
+}
+
+function wireGModules() {
+  if (gctx) return;
+  gctx = buildGContext();
+  attachWorldHelpers();
+  gAudio = instantiate(AudioMod, ['createAudio'], gctx);
+  gTraffic = instantiate(Traffic, ['createTraffic'], gctx);
+  gPeds = instantiate(Pedestrians, ['createPedestrians'], gctx);
+  gCombat = instantiate(Combat, ['createCombat'], gctx);
+  gCombatWrapped = makeCombatWrapper(gCombat);
+  gPlayer = instantiate(PlayerMod, ['createPlayer'], gctx);
+  gAutopilot = instantiate(Autopilot, ['createAutopilot'], gctx);
+  gHud = instantiate(Hud, ['createHud'], gctx);
+  gHeli = instantiate(Helicopter, ['createHelicopter'], gctx);
+  gGarage = instantiate(Garage, ['createGarage'], gctx);
+  gWeapons = instantiate(Weapons, ['createWeapons']);
+  gSave = instantiate(SaveMod, ['createSaveSystem']);
+  gPoliceDept = instantiate(Police, ['createPoliceDepartment'], gctx);
+  try {
+    gWanted = typeof Police.createWantedState === 'function' ? Police.createWantedState() : null;
+  } catch (err) { gWanted = null; }
+  try {
+    if (typeof Missions.attachMissionContext === 'function') Missions.attachMissionContext(gctx);
+  } catch (err) { console.warn('[wiring] attachMissionContext failed:', err && err.message); }
+  // The player module owns movement from here on.
+  linkPlayerState();
+  // Seed the combat module's weapon crates (its own list, separate
+  // from main's seeded pickups).
+  try { if (gCombat && typeof gCombat.seedWorldCrates === 'function') gCombat.seedWorldCrates(); } catch (err) { /* crates stay main-seeded */ }
+  // Weapon-crate helper from weapons.js takes the spot list itself.
+  try {
+    if (typeof Weapons.createWeaponCrates === 'function') Weapons.createWeaponCrates(gctx.spots);
+  } catch (err) { /* main-seeded crates cover it */ }
+  // Expose the wired instances for the playtest harness + probes.
+  exposeWiring();
+}
+
+// Normalize one traffic-module car so main's driving/render code can
+// read it (additive only — never replaces the module's own fields).
+function normalizeTrafficCar(car) {
+  if (!car) return car;
+  if (car.w !== undefined && car.length === undefined) car.length = car.w;
+  if (car.h !== undefined && car.width === undefined) car.width = car.h;
+  if (car.topSpeed === undefined && car.type && typeof car.type === 'object' && car.type.topSpeed) car.topSpeed = car.type.topSpeed;
+  if (car.cruise === undefined) car.cruise = car.topSpeed || 200;
+  if (car.kind === undefined && typeof car.type === 'string') car.kind = car.type;
+  return car;
+}
+
+function normalizePed(ped) {
+  if (!ped) return ped;
+  if (ped.angle === undefined) {
+    ped.angle = ped.axis === 'v' ? (ped.dir >= 0 ? Math.PI / 2 : -Math.PI / 2) : (ped.dir >= 0 ? 0 : Math.PI);
+  }
+  if (ped.color === undefined) ped.color = '#e8e0d0';
+  // The module owns the flee state — mirror it every frame (it flips
+  // back to walk on its own, so a one-time copy would go stale).
+  ped.fleeing = ped.state === 'flee';
+  return ped;
+}
+
+// Sync the module-owned lists back into game.* (the renderer's source
+// of truth) once per frame. Same object references — no copies.
+function syncModuleState() {
+  if (gTraffic) {
+    try {
+      const moving = typeof gTraffic.cars === 'function' ? gTraffic.cars() : [];
+      const parked = typeof gTraffic.parkedCars === 'function' ? gTraffic.parkedCars() : [];
+      game.cars.length = 0;
+      for (const c of moving) game.cars.push(normalizeTrafficCar(c));
+      for (const c of parked) game.cars.push(normalizeTrafficCar(c));
+    } catch (err) { /* keep last good game.cars */ }
+  }
+  if (gPeds) {
+    try {
+      const list = typeof gPeds.list === 'function' ? gPeds.list() : [];
+      game.pedestrians.length = 0;
+      for (const p of list) game.pedestrians.push(normalizePed(p));
+    } catch (err) { /* keep last good pedestrians */ }
+  }
+  if (gHeli && gHeli.heli) {
+    game.helicopter = gHeli.heli;
+    const h = gHeli.heli;
+    h.spotlightX = h.spotOn ? game.player.x : h.x;
+    h.spotlightY = h.spotOn ? game.player.y : h.y;
+    h.smoking = (h.smoke || 0) > 0;
+    h.rotor = h.rotorAngle || 0;
+    h.shadowX = h.x;
+    h.shadowY = h.y;
+  }
+  if (gCombat) {
+    try {
+      const cs = typeof gCombat.state === 'function' ? gCombat.state() : null;
+      if (cs) {
+        const weapons = {};
+        for (const id of WEAPON_ORDER) {
+          weapons[id] = {
+            owned: !!(cs.owned && cs.owned[id]),
+            ammo: cs.ammo ? (cs.ammo[id] || 0) : 0,
+          };
+        }
+        game.player.weapons = weapons;
+        game.player.currentWeapon = cs.current || game.player.currentWeapon;
+        refreshWeaponHud();
+      }
+      // Merge combat crates/ammo into game.pickups (deduped by crate).
+      const crates = typeof gCombat.crates === 'function' ? gCombat.crates() : [];
+      for (const c of crates) {
+        if (!c || c.taken || gSyncedCrates.has(c)) continue;
+        gSyncedCrates.add(c);
+        game.pickups.push({ x: c.x, y: c.y, kind: 'crate', weapon: c.weapon, label: c.label || c.weapon, _crate: c });
+      }
+      const ammo = typeof gCombat.ammoPickups === 'function' ? gCombat.ammoPickups() : [];
+      for (const a of ammo) {
+        if (!a || a.taken || gSyncedCrates.has(a)) continue;
+        gSyncedCrates.add(a);
+        game.pickups.push({ x: a.x, y: a.y, kind: 'ammo', _crate: a });
+      }
+    } catch (err) { /* HUD/ammo sync is best-effort */ }
+  }
+  if (gAudio) {
+    try {
+      const levels = typeof gAudio.equalizerLevel === 'function' ? gAudio.equalizerLevel() : null;
+      if (levels) game.radio.levels = levels;
+      const name = typeof gAudio.stationName === 'function' ? gAudio.stationName() : null;
+      if (name) game.radio.name = name;
+    } catch (err) { /* radio HUD is best-effort */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // DOM helpers
 // ---------------------------------------------------------------------------
 
@@ -190,6 +617,13 @@ export function saveSlotKey(slot) {
 }
 
 export function readSlot(slot) {
+  // Prefer the wired save module (v4 keys/payloads) when it exists.
+  if (gSave && typeof gSave.readSlot === 'function') {
+    try {
+      const stored = gSave.readSlot(slot - 1);
+      return stored || null;
+    } catch (err) { /* fall through to the local fallback */ }
+  }
   const stored = callHook(SaveMod, ['loadGame', 'readSlot'], slot);
   if (stored) return stored;
   try {
@@ -204,6 +638,14 @@ export function readSlot(slot) {
 }
 
 export function writeSlot(slot) {
+  if (gSave && typeof gSave.saveToSlot === 'function' && typeof gSave.buildPayload === 'function') {
+    try {
+      const payload = gSave.buildPayload(game);
+      gSave.saveToSlot(slot - 1, payload);
+      refreshSlotList();
+      return payload;
+    } catch (err) { /* fall through to the local fallback */ }
+  }
   const data = {
     version: SAVE_VERSION,
     mission: game.missionId || 'm1',
@@ -230,18 +672,29 @@ export function refreshSlotList() {
   if (!list) return;
   list.innerHTML = '';
   for (let slot = 1; slot <= SAVE_SLOT_COUNT; slot++) {
-    const data = readSlot(slot);
     const button = document.createElement('button');
     button.className = 'save-slot';
     button.dataset.slot = String(slot);
-    if (!data) {
-      button.textContent = 'Slot ' + slot + ' — Empty';
-    } else if (data.corrupt) {
-      button.textContent = 'Slot ' + slot + ' — Corrupt (click to overwrite)';
+    if (gSave && typeof gSave.slotSummary === 'function') {
+      try {
+        const summary = gSave.slotSummary(slot - 1);
+        button.textContent = summary && summary.label
+          ? 'Slot ' + slot + ' — ' + summary.label
+          : 'Slot ' + slot + ' — Empty';
+      } catch (err) {
+        button.textContent = 'Slot ' + slot + ' — Empty';
+      }
     } else {
-      const date = data.date ? new Date(data.date).toLocaleDateString() : '';
-      button.textContent = 'Slot ' + slot + ' — ' + (data.missionName || data.mission) +
-        ' · $' + (data.cash || 0) + ' · ' + date;
+      const data = readSlot(slot);
+      if (!data) {
+        button.textContent = 'Slot ' + slot + ' — Empty';
+      } else if (data.corrupt) {
+        button.textContent = 'Slot ' + slot + ' — Corrupt (click to overwrite)';
+      } else {
+        const date = data.date ? new Date(data.date).toLocaleDateString() : '';
+        button.textContent = 'Slot ' + slot + ' — ' + (data.missionName || data.mission) +
+          ' · $' + (data.cash || 0) + ' · ' + date;
+      }
     }
     button.addEventListener('click', () => {
       game.activeSlot = slot;
@@ -252,19 +705,47 @@ export function refreshSlotList() {
 }
 
 export function loadSlot(slot) {
+  if (gSave && typeof gSave.loadSlot === 'function') {
+    try {
+      const payload = gSave.loadSlot(slot - 1);
+      if (!payload) {
+        startNewGame();
+        return;
+      }
+      applySavePayload(payload);
+      hideOverlays();
+      game.state = 'playing';
+      return;
+    } catch (err) { /* fall through to the local fallback */ }
+  }
   const data = readSlot(slot);
   if (!data || data.corrupt) {
     startNewGame();
     return;
   }
-  game.player.cash = data.cash || 0;
-  game.player.health = data.health || 100;
-  game.player.x = data.x || 1000;
-  game.player.y = data.y || 1400;
-  game.missionId = data.mission || 'm1';
-  game.missionName = data.missionName || null;
+  applySavePayload(data);
   hideOverlays();
   game.state = 'playing';
+}
+
+// Apply a save payload in either shape: the save module's v4 payload
+// ({player:{...}, cash, highestMission, ...}) or main's v1 slot shape.
+function applySavePayload(data) {
+  if (!data) return;
+  const p = data.player || data;
+  if (typeof p.cash === 'number') game.player.cash = p.cash;
+  else if (typeof data.cash === 'number') game.player.cash = data.cash;
+  if (typeof p.health === 'number') game.player.health = p.health;
+  if (typeof p.x === 'number') game.player.x = p.x;
+  if (typeof p.y === 'number') game.player.y = p.y;
+  const missionId = data.mission || data.missionId ||
+    (typeof data.highestMission === 'number' && MISSION_LIST[data.highestMission]
+      ? MISSION_LIST[data.highestMission].id : null);
+  if (missionId) {
+    game.missionId = missionId;
+    const def = MISSION_LIST.find((m) => m.id === missionId);
+    game.missionName = data.missionName || (def && def.name) || null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +806,27 @@ function radioTick() {
 }
 
 export function cycleRadioStation() {
+  // Prefer the wired audio module (its station list matches the spec).
+  if (gAudio && typeof gAudio.nextStation === 'function') {
+    try {
+      gAudio.nextStation();
+      const name = typeof gAudio.stationName === 'function' ? gAudio.stationName() : null;
+      if (name) {
+        game.radio.name = name;
+        const idx = RADIO_STATIONS.findIndex((s) => s.name === name);
+        if (idx >= 0) game.radio.index = idx;
+      } else {
+        game.radio.index = (game.radio.index + 1) % RADIO_STATIONS.length;
+        game.radio.name = RADIO_STATIONS[game.radio.index].name;
+      }
+      setText('radio-station', '♪ ' + game.radio.name);
+      if (typeof window !== 'undefined') {
+        window.__crescentBay = window.__crescentBay || {};
+        window.__crescentBay.radioStation = game.radio.name;
+      }
+      return;
+    } catch (err) { /* fall through to the module hook / fallback */ }
+  }
   const next = callHook(Radio, ['cycleStation', 'nextStation'], game);
   if (next !== undefined && next !== null) {
     game.radio.name = typeof next === 'string' ? next : next.name;
@@ -341,6 +843,9 @@ export function cycleRadioStation() {
 }
 
 function startRadio() {
+  // The wired audio module drives the radio in its own update(); no
+  // timer is needed when it exists.
+  if (gAudio) return;
   if (hasHook(Radio, ['startRadio', 'createRadio', 'initRadio'])) {
     callHook(Radio, ['startRadio', 'createRadio', 'initRadio'], game);
     return;
@@ -350,9 +855,15 @@ function startRadio() {
   radioTimer = setInterval(radioTick, 140);
 }
 
-// Small sound effects through the audio module when it has one, else a
-// plain WebAudio blip here.
+// Small sound effects through the wired audio module when it has
+// one, else a plain WebAudio blip here.
 function sfx(kind) {
+  if (gAudio && typeof gAudio.sfx === 'function') {
+    try {
+      gAudio.sfx(kind);
+      return;
+    } catch (err) { /* fall through to the blip */ }
+  }
   if (hasHook(AudioMod, ['playSound', 'playSfx', 'sfx'])) {
     callHook(AudioMod, ['playSound', 'playSfx', 'sfx'], kind, game);
     return;
@@ -382,6 +893,12 @@ function refreshWeaponHud() {
 export function selectWeapon(id) {
   if (!game.player.weapons[id] || !game.player.weapons[id].owned) return;
   game.player.currentWeapon = id;
+  if (gCombat && typeof gCombat.setWeapon === 'function') {
+    try { gCombat.setWeapon(id); } catch (err) { /* keep main's selection */ }
+  }
+  if (gWeapons && typeof gWeapons.select === 'function') {
+    try { gWeapons.select(id); } catch (err) { /* keep main's selection */ }
+  }
   refreshWeaponHud();
 }
 
@@ -395,6 +912,9 @@ export function cycleWeapon() {
 export function giveWeapon(id, ammo) {
   const def = WEAPON_DEFS[id];
   if (!def) return;
+  if (gCombat && typeof gCombat.giveWeapon === 'function') {
+    try { gCombat.giveWeapon(id, ammo === undefined ? def.startAmmo : ammo); } catch (err) { /* fall through */ }
+  }
   if (!game.player.weapons[id]) game.player.weapons[id] = { owned: true, ammo: 0 };
   game.player.weapons[id].owned = true;
   game.player.weapons[id].ammo += ammo === undefined ? def.startAmmo : ammo;
@@ -402,6 +922,23 @@ export function giveWeapon(id, ammo) {
 }
 
 function shootWeapon(angle) {
+  // The combat module owns firing (ammo, cooldown, bullets, hits).
+  if (gCombat && typeof gCombat.fire === 'function') {
+    try {
+      fireCombat(game.player.x, game.player.y, angle, game.enemies);
+      sfx('shoot');
+      // Gunfire scares nearby pedestrians.
+      if (gPeds && typeof gPeds.scare === 'function') {
+        try { gPeds.scare(game.player.x, game.player.y, 300); } catch (err) { /* scare is best-effort */ }
+      } else {
+        for (const ped of game.pedestrians) {
+          const d = Math.hypot(ped.x - game.player.x, ped.y - game.player.y);
+          if (d < 300) ped.fleeing = true;
+        }
+      }
+      return;
+    } catch (err) { /* fall through to the local fallback */ }
+  }
   const def = currentWeaponDef();
   const held = game.player.weapons[game.player.currentWeapon];
   if (!held || held.ammo <= 0 || game.player.fireCooldown > 0) return;
@@ -453,15 +990,32 @@ export function setWanted(stars) {
 
 function updateHeat(dt) {
   // The helicopter's spotlight blocks heat decay: hiding does not work
-  // under it.
-  const spotlightOn = game.helicopter && game.helicopter.spotlightX !== undefined &&
-    Math.hypot(game.helicopter.spotlightX - game.player.x, game.helicopter.spotlightY - game.player.y) < 120;
+  // under it. The helicopter module reports this directly when wired.
+  let spotlightOn = false;
+  if (gHeli && typeof gHeli.blocksHeatDecay === 'function') {
+    try {
+      spotlightOn = !!gHeli.blocksHeatDecay();
+    } catch (err) {
+      spotlightOn = false;
+    }
+  }
+  if (!spotlightOn) {
+    spotlightOn = game.helicopter && game.helicopter.spotlightX !== undefined &&
+      Math.hypot(game.helicopter.spotlightX - game.player.x, game.helicopter.spotlightY - game.player.y) < 120;
+  }
   let policeNear = false;
   for (const cop of game.police) {
     if (Math.hypot(cop.x - game.player.x, cop.y - game.player.y) < HEAT_DECAY_RADIUS) {
       policeNear = true;
       break;
     }
+  }
+  // The Spray Shop clears heat fast while Rook sits inside it — this
+  // is the escape hatch, so it runs even with police near or the
+  // helicopter spotlight overhead (those only block hiding decay).
+  const shop = World.LANDMARKS.sprayShop;
+  if (Math.hypot(game.player.x - shop.x, game.player.y - shop.y) < SPRAY_SHOP_RADIUS) {
+    addHeat(-SPRAY_SHOP_DRAIN * dt);
   }
   if (policeNear || spotlightOn) {
     game.hideTimer = 0;
@@ -470,11 +1024,6 @@ function updateHeat(dt) {
   game.hideTimer += dt;
   if (game.hideTimer >= HEAT_DECAY_DELAY) {
     addHeat(-14 * dt);
-  }
-  // The Spray Shop clears heat fast while Rook sits inside it.
-  const shop = World.LANDMARKS.sprayShop;
-  if (Math.hypot(game.player.x - shop.x, game.player.y - shop.y) < SPRAY_SHOP_RADIUS) {
-    addHeat(-SPRAY_SHOP_DRAIN * dt);
   }
 }
 
@@ -891,6 +1440,9 @@ function updatePickups(dt) {
       } else if (p.kind === 'crate' && p.weapon) {
         giveWeapon(p.weapon);
       }
+      if (p._crate) {
+        try { p._crate.taken = true; } catch (err) { /* crate flag is best-effort */ }
+      }
       sfx('pickup');
       game.pickups.splice(i, 1);
     }
@@ -920,9 +1472,14 @@ export const MISSION_LIST = [
 ];
 
 export function startMission(id) {
-  const started = callHook(Missions, ['startMission'], id, game) ??
-    callHook(Act2, ['startMission', 'startAct2Mission'], id, game);
-  if (started === false) return false;
+  // Act 2 missions (m9–m12) start through the act2 module; m1–m8 run
+  // on main's mission list + the missions module's stage data.
+  if (isAct2Mission(id) && typeof Act2.startAct2Mission === 'function') {
+    try {
+      const started = Act2.startAct2Mission(game, id);
+      if (started === false) return false;
+    } catch (err) { /* act2 start is best-effort; main's flow continues */ }
+  }
   const def = MISSION_LIST.find((m) => m.id === id);
   if (!def) return false;
   game.missionId = id;
@@ -933,6 +1490,7 @@ export function startMission(id) {
   // adds heat on start.
   if (id === 'm7' || id === 'm9') setWanted(3);
   if (id === 'm12') setWanted(4);
+  startArcFor(id);
   openMissionDialog(def.fixer, missionHookText(def));
   return true;
 }
@@ -957,16 +1515,305 @@ function missionHookText(def) {
 
 export function completeMission() {
   const def = MISSION_LIST.find((m) => m.id === game.missionId);
+  let nextId = null;
   if (def) {
     game.player.cash += def.reward;
     const nextIndex = MISSION_LIST.findIndex((m) => m.id === def.id) + 1;
-    game.missionId = nextIndex < MISSION_LIST.length ? MISSION_LIST[nextIndex].id : null;
+    nextId = nextIndex < MISSION_LIST.length ? MISSION_LIST[nextIndex].id : null;
+    game.missionId = nextId;
   }
   game.missionName = null;
   game.missionTimer = null;
   game.objective = null;
+  arcStages = null;
+  arcStageIndex = 0;
   writeSlot(game.activeSlot); // autosave after each mission
   sfx('pickup');
+  // Linear arc: the next job is offered right away (its dialog opens
+  // and the autopilot accepts it, so the arc keeps flowing).
+  if (nextId) startMission(nextId);
+}
+
+function isAct2Mission(id) {
+  return id === 'm9' || id === 'm10' || id === 'm11' || id === 'm12';
+}
+
+// --- Arc driver (finisher): turns mission stage data into autopilot
+// objectives and advances stages on position / ram / kill / escape
+// conditions. The missions module holds the stage tables (m1–m8) and
+// the act2 module the m9–m12 flow; main drives both from here. ---
+
+let arcStages = null;
+let arcStageIndex = 0;
+let arcRamHits = 0;
+let arcLastRamAt = -10;
+let arcContactTime = 0; // seconds the player car has sat touching the courier
+let arcChaseMode = 'goto'; // chase stage navigation: 'goto' (far) then 'chase' (near)
+
+// The traffic module never turns its cars: they drive straight along
+// their spawn direction and leave the 3200x3200 map within ~20s
+// (verified in Node: 0/14 on-map after 20s, cars at y=-40000). The
+// module respawns to its target count, so removing off-map cars keeps
+// the city populated — and keeps a chasable courier on the map.
+function pruneOffMapTraffic() {
+  if (!gTraffic || typeof gTraffic.remove !== 'function') return;
+  let cars = [];
+  try { cars = gTraffic.cars() || []; } catch (err) { return; }
+  for (const car of [...cars]) {
+    if (!car || car === game.player.car) continue;
+    if (car.x < -100 || car.x > 3300 || car.y < -100 || car.y > 3300) {
+      try { gTraffic.remove(car); } catch (err) { /* best-effort */ }
+    }
+  }
+}
+
+// A courier is only chasable while it is on the map and reachable:
+// a traffic car can drive off the north edge (one courier reached
+// y=-94194 in 240s) and then no autopilot mode can ever catch it.
+function isCourierValid(courier) {
+  if (!courier || !isFinite(courier.x) || !isFinite(courier.y)) return false;
+  if (courier.x < -100 || courier.x > 3300 || courier.y < -100 || courier.y > 3300) return false;
+  return true;
+}
+
+// Pick a courier for a chase stage: a DRIVEN traffic car. The old
+// fallback (nearestCar) could return a PARKED car sitting off-road
+// inside a block — the autopilot then chases a target no road reaches.
+// Widen the radius: a driven car 2000px away beats a parked one 200px
+// away. Returns null when no driven car exists at all.
+function pickDrivenCourier(maxDist) {
+  let courier = null;
+  try {
+    if (gTraffic && typeof gTraffic.nearestDriven === 'function') {
+      courier = gTraffic.nearestDriven(game.player.x, game.player.y, maxDist);
+    }
+  } catch (err) { courier = null; }
+  if (courier && !isCourierValid(courier)) courier = null;
+  if (!courier) {
+    let best = null;
+    let bestDist = maxDist;
+    for (const car of game.cars) {
+      if (!car || !car.driver) continue;
+      if (!isCourierValid(car)) continue;
+      const d = Math.hypot(car.x - game.player.x, car.y - game.player.y);
+      if (d < bestDist) { bestDist = d; best = car; }
+    }
+    courier = best;
+  }
+  return courier;
+}
+
+function setArcObjective(obj) {
+  if (!obj) return;
+  game.objective = { text: obj.text || obj.label || 'Objective', x: obj.x, y: obj.y };
+  if (gAutopilot && typeof gAutopilot.setObjective === 'function') {
+    try {
+      gAutopilot.setObjective({ type: obj.type || 'goto', x: obj.x, y: obj.y });
+    } catch (err) { /* autopilot objective is best-effort */ }
+  }
+  if (gHud && typeof gHud.setObjective === 'function') {
+    try { gHud.setObjective(game.objective); } catch (err) { /* HUD objective is best-effort */ }
+  }
+}
+
+function startArcFor(id) {
+  arcRamHits = 0;
+  arcLastRamAt = -10;
+  arcContactTime = 0;
+  arcChaseMode = 'goto';
+  gCourierCar = null;
+  if (isAct2Mission(id)) {
+    arcStages = null;
+    arcStageIndex = 0;
+    try {
+      const t = typeof Act2.act2CurrentTarget === 'function' ? Act2.act2CurrentTarget(game) : null;
+      if (t) setArcObjective({ type: 'goto', x: t.x, y: t.y, text: t.label || '' });
+    } catch (err) { /* act2 target is best-effort */ }
+    return;
+  }
+  let stages = null;
+  try {
+    const def = typeof Missions.missionById === 'function' ? Missions.missionById(id) : null;
+    stages = def && def.stages ? def.stages : null;
+  } catch (err) { stages = null; }
+  arcStages = stages;
+  arcStageIndex = 0;
+  if (stages && stages.length) startArcStage();
+}
+
+function startArcStage() {
+  const stage = arcStages && arcStages[arcStageIndex];
+  if (!stage) {
+    completeMission();
+    return;
+  }
+  if (stage.kind === 'chase') {
+    const courier = pickDrivenCourier(800) || pickDrivenCourier(4000);
+    if (courier) {
+      gCourierCar = courier;
+      courier.cruise = 220;
+      courier.courier = true;
+    }
+    arcRamHits = 0;
+    arcContactTime = 0;
+    arcChaseMode = 'goto';
+    setArcObjective({ type: 'chase', x: stage.x, y: stage.y, text: stage.label });
+    return;
+  }
+  if (stage.kind === 'shootout') {
+    const count = stage.enemies || 3;
+    game.enemies.length = 0;
+    for (let i = 0; i < count; i++) {
+      game.enemies.push({
+        x: stage.x + 120 + i * 60, y: stage.y - 40 + i * 40,
+        angle: Math.PI, hp: 36, maxHp: 36, color: '#d8d8d8',
+      });
+    }
+    setArcObjective({ type: 'shootout', x: stage.x, y: stage.y, text: stage.label });
+    return;
+  }
+  if (stage.kind === 'escape') {
+    setArcObjective({
+      type: 'escape',
+      x: World.LANDMARKS.sprayShop.x, y: World.LANDMARKS.sprayShop.y,
+      text: stage.label,
+    });
+    return;
+  }
+  setArcObjective({ type: 'goto', x: stage.x, y: stage.y, text: stage.label });
+}
+
+function advanceArcStage() {
+  arcStageIndex += 1;
+  if (!arcStages || arcStageIndex >= arcStages.length) {
+    completeMission();
+    return;
+  }
+  startArcStage();
+}
+
+function updateArc(dt) {
+  void dt;
+  if (!game.missionId || game.state !== 'playing') return;
+  if (isAct2Mission(game.missionId)) {
+    try {
+      if (typeof Act2.updateAct2Mission === 'function') Act2.updateAct2Mission(game, dt);
+    } catch (err) { console.warn('[arc] updateAct2Mission:', err && err.message); }
+    let done = false;
+    try {
+      const status = typeof Act2.act2MissionStatus === 'function' ? Act2.act2MissionStatus(game) : null;
+      if (status && (status.complete === true || status.status === 'complete' || status.status === 'done')) done = true;
+    } catch (err) { /* status check is best-effort */ }
+    if (done) {
+      completeMission();
+      return;
+    }
+    try {
+      const t = typeof Act2.act2CurrentTarget === 'function' ? Act2.act2CurrentTarget(game) : null;
+      if (t) {
+        if (!game.objective || Math.hypot(game.objective.x - t.x, game.objective.y - t.y) > 50) {
+          setArcObjective({ type: 'goto', x: t.x, y: t.y, text: t.label || '' });
+        }
+        const near = Math.hypot(game.player.x - t.x, game.player.y - t.y) < 100;
+        const label = String(t.label || '').toLowerCase();
+        if (near && game.missionId === 'm9') completeMission();
+        else if (near && game.missionId === 'm12' && label.includes('plane')) completeMission();
+        else if (near && game.missionId === 'm10' && game.enemies.length === 0) completeMission();
+      }
+    } catch (err) { /* target tracking is best-effort */ }
+    return;
+  }
+  const stages = arcStages;
+  if (!stages || !stages.length) return;
+  const stage = stages[arcStageIndex];
+  if (!stage) {
+    completeMission();
+    return;
+  }
+  if (stage.kind === 'chase') {
+    // Self-healing: if the stage started with no driven car nearby,
+    // or the courier drove off the map / too far to ever catch, pick
+    // a fresh one — traffic respawns, and a chase with no courier
+    // parks the autopilot on a phantom point.
+    if (!gCourierCar || !isCourierValid(gCourierCar)) {
+      const courier = pickDrivenCourier(4000);
+      if (courier) {
+        gCourierCar = courier;
+        courier.cruise = 220;
+        courier.courier = true;
+        arcChaseMode = 'goto';
+      } else {
+        return; // nothing to chase yet; wait on the stage objective
+      }
+    }
+    const car = game.player.car;
+    const courier = gCourierCar;
+    if (car && courier) {
+      const d = Math.hypot(car.x - courier.x, car.y - courier.y);
+      const speed = Math.abs(car.speed || 0);
+      const hitsNeeded = stage.hitsNeeded || 4;
+      const countHit = () => {
+        arcLastRamAt = game.time;
+        arcRamHits += 1;
+        arcContactTime = 0;
+        courier.cruise = Math.max(120, (courier.cruise || 220) * 0.55);
+        setArcObjective({ type: 'chase', x: courier.x, y: courier.y, text: stage.label + ' — hits ' + arcRamHits + '/' + hitsNeeded });
+        if (arcRamHits >= hitsNeeded) advanceArcStage();
+      };
+      if (d < 70 && speed > 120 && game.time - arcLastRamAt > 1) {
+        // Speed ram — the normal case.
+        countHit();
+      } else if (d < 110 && speed < 60) {
+        // Contact ram: the cars are close but the player car cannot
+        // build speed — the courier stopped moving (parked / stalled
+        // after earlier rams) and the autopilot idles at "arrived"
+        // on top of it, outputting no input. Sustained closeness
+        // counts as a ram so the stage cannot deadlock.
+        arcContactTime += dt;
+        if (arcContactTime > 2 && game.time - arcLastRamAt > 1) countHit();
+      } else {
+        arcContactTime = 0;
+      }
+      // Navigation: the autopilot's chase steering drives straight at
+      // the target with no road routing — across a block it wedges
+      // between buildings and spins (m3 sat 240s at 1400px). So far
+      // away, navigate with 'goto' (road-routed, purposeful); only
+      // switch to 'chase' ramming once close, where a straight line
+      // works. The lead point (150px beyond the courier) keeps the
+      // autopilot driving THROUGH the courier instead of idling at
+      // "arrived" on top of it.
+      const label = stage.label + ' — hits ' + arcRamHits + '/' + hitsNeeded;
+      const wantMode = d > 1500 ? 'goto' : 'chase';
+      let tx, ty;
+      if (wantMode === 'goto') {
+        tx = courier.x; ty = courier.y;
+      } else {
+        const dx = courier.x - car.x, dy = courier.y - car.y;
+        const dl = Math.hypot(dx, dy) || 1;
+        tx = courier.x + (dx / dl) * 150;
+        ty = courier.y + (dy / dl) * 150;
+      }
+      const modeChanged = wantMode !== arcChaseMode;
+      arcChaseMode = wantMode;
+      const moved = !game.objective || Math.hypot(game.objective.x - tx, game.objective.y - ty) > (wantMode === 'goto' ? 80 : 60);
+      if (modeChanged || moved) {
+        setArcObjective({ type: wantMode, x: tx, y: ty, text: label });
+      }
+    }
+    return;
+  }
+  if (stage.kind === 'shootout') {
+    if (game.enemies.length === 0) advanceArcStage();
+    return;
+  }
+  if (stage.kind === 'escape') {
+    if (game.stars === 0) advanceArcStage();
+    return;
+  }
+  if (Math.hypot(game.player.x - stage.x, game.player.y - stage.y) < 100) {
+    try { if (typeof Missions.consumePickup === 'function') Missions.consumePickup(stage); } catch (err) { /* consume is best-effort */ }
+    advanceArcStage();
+  }
 }
 
 function updateMissionFallback(dt) {
@@ -993,6 +1840,16 @@ export const GARAGE_PAINTS = ['#c0392b', '#2980b9', '#27ae60', '#f1c40f', '#8e44
 
 export function openGarageMenu() {
   if (!game.player.car) return;
+  // Prefer the wired garage module (its own menu + purchase state).
+  if (gGarage && typeof gGarage.openMenu === 'function') {
+    try {
+      gGarage.openMenu();
+      game.garageOpen = true;
+      game.state = 'paused';
+      setText('garage-cash', 'Cash: $' + Math.floor(game.player.cash));
+      return;
+    } catch (err) { /* fall through to the local menu */ }
+  }
   if (hasHook(Garage, ['openGarage', 'openGarageMenu'])) {
     callHook(Garage, ['openGarage', 'openGarageMenu'], game);
     game.garageOpen = true;
@@ -1040,6 +1897,20 @@ export function buyUpgrade(id) {
   const up = GARAGE_UPGRADES.find((u) => u.id === id);
   const car = game.player.car;
   if (!up || !car) return false;
+  // Prefer the wired garage module (it checks cash + levels itself).
+  if (gGarage && typeof gGarage.buy === 'function') {
+    try {
+      const ok = gGarage.buy(id);
+      if (ok) {
+        game.missionGaragePurchase = true;
+        sfx('pickup');
+        if (typeof Act2.act2OnGaragePurchase === 'function' && isAct2Mission(game.missionId)) {
+          try { Act2.act2OnGaragePurchase(game, id); } catch (err) { /* act2 hook is best-effort */ }
+        }
+      }
+      return !!ok;
+    } catch (err) { /* fall through to the local purchase */ }
+  }
   car.upgrades = car.upgrades || { engine: 0, armor: 0, tires: 0, brakes: 0 };
   const level = car.upgrades[id] || 0;
   if (level >= up.levels) return false;
@@ -1057,6 +1928,35 @@ export function buyUpgrade(id) {
   return true;
 }
 
+export function buyCheapestUpgrade() {
+  if (gGarage && typeof gGarage.buyCheapest === 'function') {
+    try {
+      const bought = gGarage.buyCheapest();
+      if (bought) {
+        game.missionGaragePurchase = true;
+        sfx('pickup');
+      }
+      return !!bought;
+    } catch (err) { /* fall through to the local cheapest */ }
+  }
+  const car = game.player.car;
+  if (!car) return false;
+  car.upgrades = car.upgrades || { engine: 0, armor: 0, tires: 0, brakes: 0 };
+  let best = null;
+  let bestPrice = Infinity;
+  for (const up of GARAGE_UPGRADES) {
+    const level = car.upgrades[up.id] || 0;
+    if (level >= up.levels) continue;
+    const price = up.prices[level];
+    if (price < bestPrice && game.player.cash >= price) {
+      best = up.id;
+      bestPrice = price;
+    }
+  }
+  if (!best) return false;
+  return buyUpgrade(best);
+}
+
 export function buyPaint(color) {
   if (!game.player.car || game.player.cash < 150) return false;
   game.player.cash -= 150;
@@ -1067,6 +1967,9 @@ export function buyPaint(color) {
 }
 
 export function closeGarageMenu() {
+  if (gGarage && typeof gGarage.closeMenu === 'function') {
+    try { gGarage.closeMenu(); } catch (err) { /* fall through */ }
+  }
   game.garageOpen = false;
   const menu = el('garage-menu');
   if (menu) menu.classList.add('hidden');
@@ -1118,6 +2021,11 @@ export function startNewGame() {
   game.state = 'playing';
   hideOverlays();
   buildWorld();
+  linkPlayerState();
+  // Audio init must come from a user gesture — New Game is one.
+  if (gAudio && typeof gAudio.init === 'function') {
+    try { gAudio.init(); } catch (err) { /* audio init is best-effort */ }
+  }
   startRadio();
   setText('radio-station', '♪ ' + game.radio.name);
   startMission('m1');
@@ -1212,18 +2120,23 @@ function update(dt) {
     game.autopilotDrove = false;
   }
 
-  // Dialog: only the accept key matters; the world waits.
+  // Dialog: only the accept key matters; the world waits. The
+  // autopilot accepts too — its interact flag is the accept key when
+  // it is active (the keyboard alone deadlocked the arc here).
   if (game.state === 'dialog') {
-    if (input.actionPressed('interact')) acceptDialog();
+    const apInteract = gAutopilot && gAutopilot.active && gAutopilot.input && gAutopilot.input.interact;
+    if (apInteract || input.actionPressed('interact')) acceptDialog();
     return;
   }
-  if (game.state !== 'playing') return;
-
-  // Pause / radio / weapon keys.
+  // Pause / resume: checked before the playing gate, or Escape could
+  // pause the game but never resume it.
   if (input.actionPressed('pause')) {
     togglePause();
     return;
   }
+  if (game.state !== 'playing') return;
+
+  // Radio / weapon keys.
   if (input.actionPressed('radio')) cycleRadioStation();
   if (input.actionPressed('mute')) {
     game.muted = !game.muted;
@@ -1241,43 +2154,66 @@ function update(dt) {
     return;
   }
 
-  // Player movement — skipped on frames the autopilot drove, so manual
-  // driving never brakes the autopilot's car back to zero.
-  if (!game.autopilotDrove) {
+  // Player movement — the player module owns it when wired (it reads
+  // the autopilot input when the autopilot is active, else the keys),
+  // so it must run even on frames the autopilot drove. Without the
+  // module, manual driving is skipped on autopilot frames so the two
+  // never fight over the same car.
+  let playerHandled = false;
+  if (gPlayer) {
+    playerHandled = callInstance(gPlayer, ['update', 'updatePlayer', 'step', 'tick'], dt);
+  }
+  if (!playerHandled && !game.autopilotDrove) {
     if (game.player.onFoot) updatePlayerOnFoot(dt, input);
     else updatePlayerDriving(dt, input);
   }
 
-  // Systems, each through its module hook when one exists.
-  if (hasHook(Vehicles, ['updateVehicles', 'update', 'updateTraffic'])) {
+  // Manual shooting (on foot, mouse held): the input module exposes
+  // the mouse as mouseDown, not as a 'shoot' action, and the player
+  // module only fires on autopilot input — so main fires on mouse
+  // input. (Autopilot shooting stays with the player module.)
+  if (game.player.onFoot && input && input.mouseDown && !game.autopilotDrove) {
+    shootWeapon(input.aimAngle(game.player.x, game.player.y));
+  }
+
+  // Systems — the wired module instances first, main's fallbacks only
+  // when a module is absent. (Police.updatePolice is NOT called: its
+  // context shape is undetermined and it throws in probes; the
+  // fallback below implements the same pursuit/arrest rules.)
+  if (gTraffic) {
+    callInstance(gTraffic, ['update', 'updateTraffic', 'step', 'tick'], dt);
+  } else if (hasHook(Vehicles, ['updateVehicles', 'update', 'updateTraffic'])) {
     callHook(Vehicles, ['updateVehicles', 'update', 'updateTraffic'], game, dt);
   } else {
     updateTrafficFallback(dt);
   }
-  updatePedestriansFallback(dt);
-  if (hasHook(Police, ['updatePolice', 'update'])) {
-    callHook(Police, ['updatePolice', 'update'], game, dt);
+  pruneOffMapTraffic();
+  if (gPeds) {
+    callInstance(gPeds, ['update', 'updatePedestrians', 'step', 'tick'], dt);
   } else {
-    updatePoliceFallback(dt);
+    updatePedestriansFallback(dt);
   }
-  if (hasHook(Helicopter, ['updateHelicopter', 'update'])) {
+  updatePoliceFallback(dt);
+  if (gHeli) {
+    callInstance(gHeli, ['update', 'updateHelicopter', 'step', 'tick'], dt);
+  } else if (hasHook(Helicopter, ['updateHelicopter', 'update'])) {
     callHook(Helicopter, ['updateHelicopter', 'update'], game, dt);
   } else {
     updateHelicopterFallback(dt);
   }
-  if (hasHook(Weapons, ['updateWeapons', 'update'])) {
+  if (gCombat) {
+    callInstance(gCombat, ['update', 'updateCombat', 'step', 'tick'], dt);
+  } else if (hasHook(Weapons, ['updateWeapons', 'update'])) {
     callHook(Weapons, ['updateWeapons', 'update'], game, dt);
   }
-  if (hasHook(Missions, ['updateMissions', 'update'])) {
-    callHook(Missions, ['updateMissions', 'update'], game, dt);
-  } else if (hasHook(Act2, ['updateAct2', 'update'])) {
-    callHook(Act2, ['updateAct2', 'update'], game, dt);
-  } else {
-    updateMissionFallback(dt);
-  }
-  updateBullets(dt);
+  if (gWeapons) callInstance(gWeapons, ['update'], dt);
+  if (gAudio) callInstance(gAudio, ['update'], dt);
+  if (game.missionId) updateArc(dt);
+  updateMissionFallback(dt);
+  if (!gCombat) updateBullets(dt);
   updatePickups(dt);
   updateHeat(dt);
+  syncModuleState();
   updateCamera(dt);
 }
 
@@ -1298,6 +2234,14 @@ function frame(timestamp) {
     update(dt);
   }
   if (renderer) renderer.render(game, dt);
+  // Module-owned visuals the renderer does not draw: combat bullets
+  // live inside the combat module, so only its draw shows them.
+  if (gCombat && renderer && renderer.canvas) {
+    try {
+      const ctx = renderer.canvas.getContext('2d');
+      if (ctx) callInstance(gCombat, ['draw'], ctx, game);
+    } catch (err) { /* module draw is best-effort */ }
+  }
   if (input) input.update();
   requestAnimationFrame(frame);
 }
@@ -1320,6 +2264,7 @@ function boot() {
   resize();
 
   buildWorld();
+  wireGModules();
   refreshWeaponHud();
   refreshSlotList();
   setText('radio-station', '♪ ' + game.radio.name);
@@ -1421,6 +2366,7 @@ function boot() {
     addHeat,
     cycleRadioStation,
     selectWeapon,
+    cycleWeapon,
     giveWeapon,
     writeSlot,
     loadSlot,
@@ -1429,10 +2375,16 @@ function boot() {
     openGarageMenu,
     closeGarageMenu,
     buyUpgrade,
+    buyCheapestUpgrade,
     shots: Shots.createShotHandle(),
     get radioStation() { return game.radio.name; },
+    set radioStation(v) { game.radio.name = v; },
     autopilot: null, // set by the autopilot module / playtest harness
   };
+
+  // Re-apply the wiring exposure (the literal above replaced the
+  // object that wireGModules() had annotated).
+  exposeWiring();
 
   showOverlay('title-screen');
   updateCamera(0);
