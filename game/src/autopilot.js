@@ -858,6 +858,19 @@ export function createAutopilot(game) {
       }
     }
     if (!id) {
+      // No active mission right now — but a mission OFFER dialog may
+      // be open (this is exactly the state after m1 completes: the
+      // mission is cleared and the m2 offer waits for Accept). The
+      // dialog check MUST run before this idle return, or the offer
+      // can never be accepted and the arc stalls here forever — that
+      // is what the m1 probe showed (dialog open, car parked at the
+      // delivery point, 110 seconds, nothing happening).
+      if (dialogOpen()) {
+        state.mode = 'dialog';
+        clearMove();
+        pressInteract();
+        return state;
+      }
       state.mode = 'idle';
       clearMove();
       return state;
