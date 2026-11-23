@@ -1,388 +1,408 @@
-// player.js — Crescent Bay player control + state (fresh from prose spec §1).
+// player.js — Rook on foot and behind the wheel (Crescent Bay).
 //
-// Rook, on foot and behind the wheel. On foot: WASD/arrows move, mouse
-// aim, click shoot, Shift sprint. Driving: E enter/exit, steal parked
-// cars, carjack traffic cars (the driver flees). Health, cash, and the
-// wanted interface live here; the police module owns heat itself, this
-// module only reads it and exposes stars.
+// Owns the player character: walking / sprinting / aiming / shooting on
+// foot, entering and leaving cars (stealing parked cars, carjacking traffic
+// cars), the wanted heat meter and its stars, hiding decay, arrest
+// exposure, health and the CAUGHT / DOWN game-over states.
 //
-// The player reads input from G.input when driven by a human, and from
-// G.autopilot.input when the autopilot is active — the autopilot sets
-// that object every frame, and this module never runs both at once
-// (the autopilot-vs-manual conflict from the builder-1 notes is designed
-// out: one input source per frame, autopilot wins when active).
+// Game-state contract (duck-typed; every field is read defensively):
+//   game.state            'playing' while the world runs
+//   game.now              seconds elapsed (for damage ticks)
+//   game.dt               frame delta in seconds
+//   game.world            { isBlocked(x, y) } when present, else a
+//                         road-proximity fallback is used
+//   game.input            { keys:Set of codes } and/or booleans
+//                         up/down/left/right/sprint, mouseDown,
+//                         mousePressed (edge), interactPressed (E edge),
+//                         aimX/aimY (mouse position in world coords)
+//   game.player           the player object (see createPlayer)
+//   game.cars             array of car objects (see traffic.js)
+//   game.peds             array of pedestrian objects
+//   game.police           foot cops + patrol cars (or game.cops)
+//   game.sprayShop        { x, y, radius } — repaint garage
+//   game.helicopter       { spotlightOnPlayer } — blocks heat decay
+//   game.combat           combat module handle (fireWeapon) when wired
+//   game.audio            audio engine handle when wired
 //
-// Input shape (both sources): { up, down, left, right, sprint, interact,
-//   shoot, aimX, aimY, weapon1, weapon2, weapon3, cycleWeapon, radio }
-// Mouse aim: aimX/aimY are world coordinates; when absent the player
-// keeps the last aim angle.
-//
-// Game-over words are CAUGHT (arrested) and DOWN (killed) — never the
-// Rockstar terms (spec §1 naming rules).
-//
-// Context object G (only what this module reads):
-//   G.input     — live keyboard/mouse state
-//   G.autopilot — { active, input } when the autopilot drives
-//   G.traffic   — traffic module (nearestParked / nearestDriven / carjack)
-//   G.combat    — combat module (fire / weapon keys)
-//   G.police    — police module ({ heat, stars(), addHeat(), ... })
-//   G.audio     — optional { sfx(name), setEngine(speed01, on) }
-//   G.onEnterCar(car) / G.onExitCar(car) / G.onCarjack(car) — hooks
-//   G.onPlayerDown() / G.onPlayerCaught() — game-over hooks
-//   G.onSpendFail(amount) — optional hook when cash is short
-//   G.world     — optional { collide(x, y, r) } building/wall helper;
-//                 without it the player is clamped to the world edge
-//
-// Public API (returned by createPlayer):
-//   state            the live player object (x, y, angle, health, cash,
-//                    onFoot, car, speed, aimAngle, ...)
-//   update(dt)
-//   takeDamage(amount, source) -> 'alive' | 'down'
-//   heal(amount)
-//   addCash(n) / spendCash(n) -> bool
-//   addHeat(n)         forwards to the police module when present
-//   wantedStars()      stars from heat thresholds [0,12,30,52,74,92]
-//   enterCar(car) / exitCar() / tryEnterNearby()
-//   die(cause)         'down' | 'caught'
-//   reset(x, y)        fresh state for a new game
+// The autopilot drives the player's car on frames it sets
+// game.autopilotDrove = true; manual driving is skipped on those frames
+// so the two drivers never fight each other.
 
-export const WORLD = 3200;
-export const WALK_SPEED = 210;
-export const SPRINT_SPEED = 330;
-export const HEAT_THRESHOLDS = [0, 12, 30, 52, 74, 92];
+import { applyCarPhysics } from './traffic.js';
 
-export function createPlayer(G) {
-  const game = G || {};
+export const WANTED_STAR_THRESHOLDS = [0, 12, 30, 52, 74, 92];
+export const PLAYER_WALK_SPEED = 170;
+export const PLAYER_SPRINT_SPEED = 285;
+export const PLAYER_MAX_HEALTH = 100;
+export const HEAT_MAX = 100;
+export const HIDE_DISTANCE = 450;
+export const HIDE_TIME = 3;
+export const HEAT_DECAY_RATE = 10;
+export const SPRAY_SHOP_RADIUS = 150;
+export const SPRAY_SHOP_DRAIN = 50;
+export const ARREST_DISTANCE = 30;
+export const ARREST_HOLD_TIME = 1.2;
+export const CAR_ENTER_DISTANCE = 78;
 
-  const state = {
-    x: 600,
-    y: 600,
-    angle: 0, // facing / aim angle (on foot)
-    aimAngle: 0,
-    health: 100,
-    maxHealth: 100,
+export function computeWantedStars(heat) {
+  let stars = 0;
+  for (let i = 1; i < WANTED_STAR_THRESHOLDS.length; i++) {
+    if (heat >= WANTED_STAR_THRESHOLDS[i]) stars = i;
+  }
+  return stars;
+}
+
+export function createPlayer(x = 600, y = 800) {
+  return {
+    x, y,
+    angle: -Math.PI / 2,
+    vx: 0, vy: 0,
+    speed: 0,
+    health: PLAYER_MAX_HEALTH,
+    maxHealth: PLAYER_MAX_HEALTH,
     cash: 0,
+    heat: 0,
+    stars: 0,
+    alive: true,
     onFoot: true,
     car: null,
-    speed: 0, // on-foot speed, or the car's speed while driving
-    moving: false,
+    weapon: 'pistol',
+    owned: { pistol: true, smg: false, shotgun: false },
+    ammo: { pistol: 48, smg: 0, shotgun: 0 },
     sprinting: false,
-    dead: false,
-    caught: false,
-    // Driving state lives on the car object; these mirror it for the HUD.
-    driveAngle: 0,
-    interactCooldown: 0,
-    hurtCooldown: 0,
+    hideTimer: 0,
+    arrestTimer: 0,
+    damageFlashT: 0,
+    lastWallDamageT: -10,
   };
+}
 
-  function inputNow() {
-    const ap = game.autopilot;
-    if (ap && ap.active && ap.input) return ap.input;
-    return game.input || {};
+function keyDown(game, ...codes) {
+  const input = game.input || {};
+  const keys = input.keys;
+  if (keys && typeof keys.has === 'function') {
+    for (const code of codes) if (keys.has(code)) return true;
   }
+  for (const code of codes) if (input[code]) return true;
+  return false;
+}
 
-  function clampWorld() {
-    state.x = Math.max(24, Math.min(WORLD - 24, state.x));
-    state.y = Math.max(24, Math.min(WORLD - 24, state.y));
+function readMoveInput(game) {
+  const input = game.input || {};
+  let mx = 0, my = 0;
+  if (keyDown(game, 'KeyA', 'ArrowLeft') || input.left) mx -= 1;
+  if (keyDown(game, 'KeyD', 'ArrowRight') || input.right) mx += 1;
+  if (keyDown(game, 'KeyW', 'ArrowUp') || input.up) my -= 1;
+  if (keyDown(game, 'KeyS', 'ArrowDown') || input.down) my += 1;
+  if (input.moveX) mx += input.moveX;
+  if (input.moveY) my += input.moveY;
+  const len = Math.hypot(mx, my);
+  if (len > 1) { mx /= len; my /= len; }
+  return { mx, my };
+}
+
+function worldBlocked(game, x, y) {
+  if (x < 24 || x > 3176 || y < 24 || y > 3176) return true;
+  if (game.world && typeof game.world.isBlocked === 'function') {
+    return game.world.isBlocked(x, y);
   }
-
-  function wantedStars() {
-    const heat = game.police && typeof game.police.heat === 'number'
-      ? game.police.heat
-      : (typeof game.heat === 'number' ? game.heat : 0);
-    let stars = 0;
-    for (let i = 0; i < HEAT_THRESHOLDS.length; i++) {
-      if (heat >= HEAT_THRESHOLDS[i]) stars = i;
-    }
-    return stars;
+  // Fallback from the spec geometry: roads sit at 200 + i*400 with a
+  // 64-wide carriageway; anything further than a sidewalk from a road
+  // centreline is inside a block and blocked.
+  const coords = [200, 600, 1000, 1400, 1800, 2200, 2600, 3000];
+  let nearest = Infinity;
+  for (const c of coords) {
+    nearest = Math.min(nearest, Math.abs(x - c), Math.abs(y - c));
   }
+  return nearest > 46;
+}
 
-  function updateOnFoot(dt, input) {
-    let mx = 0;
-    let my = 0;
-    if (input.up) my -= 1;
-    if (input.down) my += 1;
-    if (input.left) mx -= 1;
-    if (input.right) mx += 1;
-    const len = Math.hypot(mx, my);
-    state.sprinting = !!input.sprint && len > 0;
-    const speed = state.sprinting ? SPRINT_SPEED : WALK_SPEED;
-    state.moving = len > 0;
-    if (len > 0) {
-      mx /= len;
-      my /= len;
-      let nx = state.x + mx * speed * dt;
-      let ny = state.y + my * speed * dt;
-      // Wall slide: try the full step, then each axis alone (spec §1:
-      // slide along walls instead of sticking).
-      const blocked = (x, y) => {
-        if (game.world && typeof game.world.collide === 'function') {
-          return game.world.collide(x, y, 14);
-        }
-        return x < 20 || x > WORLD - 20 || y < 20 || y > WORLD - 20;
-      };
-      if (!blocked(nx, ny)) {
-        state.x = nx; state.y = ny;
-      } else if (!blocked(nx, state.y)) {
-        state.x = nx;
-      } else if (!blocked(state.x, ny)) {
-        state.y = ny;
-      }
-      state.speed = speed;
-    } else {
-      state.speed = 0;
-    }
+export function addHeat(game, amount) {
+  const p = game.player;
+  if (!p) return;
+  p.heat = Math.max(0, Math.min(HEAT_MAX, p.heat + amount));
+  p.stars = computeWantedStars(p.heat);
+}
 
-    // Aim: mouse world position, or keep facing the move direction.
-    if (typeof input.aimX === 'number' && typeof input.aimY === 'number') {
-      state.aimAngle = Math.atan2(input.aimY - state.y, input.aimX - state.x);
-    } else if (len > 0) {
-      state.aimAngle = Math.atan2(my, mx);
-    }
-    state.angle = state.aimAngle;
+export function updatePlayerHeat(game, dt) {
+  const p = game.player;
+  if (!p || !p.alive) return;
+  const heli = game.helicopter;
+  const spotlighted = !!(heli && heli.active && heli.spotlightOnPlayer);
 
-    // Shooting (on foot only; combat owns ammo / rate / damage).
-    if (input.shoot && game.combat && typeof game.combat.fire === 'function') {
-      const targets = typeof game.combatTargets === 'function'
-        ? game.combatTargets()
-        : (game.targets || []);
-      game.combat.fire(state.x, state.y, state.aimAngle, targets);
-    }
-
-    // Weapon keys.
-    if (game.combat) {
-      if (input.weapon1) game.combat.setWeapon('pistol');
-      if (input.weapon2) game.combat.setWeapon('smg');
-      if (input.weapon3) game.combat.setWeapon('shotgun');
-      if (input.cycleWeapon) game.combat.cycleWeapon();
-    }
-    clampWorld();
-  }
-
-  // Radius-based steering (spec §1): the car turns on a radius so it can
-  // turn inside narrow 64-wide roads; a turn sharper than ~52 degrees
-  // (|angle diff| > 0.9) stops the car and rotates it in place.
-  function updateDriving(dt, input) {
-    const car = state.car;
-    if (!car) { state.onFoot = true; return; }
-    const type = car.type || { topSpeed: 300, accel: 220 };
-    // Garage upgrades on this car (spec §3.3): engine raises top speed,
-    // tires raise turn authority, brakes shorten stopping.
-    const up = car.upgrades || {};
-    const topSpeed = type.topSpeed * (1 + 0.15 * (up.engine || 0));
-    const accel = type.accel * (1 + 0.1 * (up.engine || 0));
-    const turnRate = 2.6 * (1 + 0.18 * (up.tires || 0));
-    const brakePower = accel * (1.6 + 0.5 * (up.brakes || 0));
-
-    let throttle = 0;
-    if (input.up) throttle = 1;
-    if (input.down) throttle = -0.7; // reverse / brake
-    const steer = (input.left ? -1 : 0) + (input.right ? 1 : 0);
-
-    // Sharp-turn rule: stop fully and rotate in place.
-    const targetAngle = car.angle + steer * turnRate * dt * Math.min(1, 0.3 + Math.abs(car.speed) / 240);
-    const diff = Math.atan2(Math.sin(targetAngle - car.angle), Math.cos(targetAngle - car.angle));
-    if (Math.abs(diff) > 0.9 && Math.abs(car.speed) < 40 && steer !== 0) {
-      car.angle += steer * 2.2 * dt;
-      car.speed = 0;
-    } else {
-      car.angle = targetAngle;
-      if (throttle > 0) {
-        car.speed = Math.min(topSpeed, car.speed + accel * dt);
-      } else if (throttle < 0) {
-        if (car.speed > 5) car.speed = Math.max(0, car.speed - brakePower * dt);
-        else car.speed = Math.max(-90, car.speed - accel * 0.6 * dt);
-      } else {
-        // Coast down.
-        car.speed = Math.abs(car.speed) < 4 ? 0 : car.speed - Math.sign(car.speed) * 130 * dt;
-      }
-    }
-
-    // Crawl-forward turns: keep a minimum turn authority at low speed.
-    if (steer !== 0 && Math.abs(car.speed) < 30 && throttle >= 0) {
-      car.speed = Math.max(car.speed, 30);
-    }
-
-    let nx = car.x + Math.cos(car.angle) * car.speed * dt;
-    let ny = car.y + Math.sin(car.angle) * car.speed * dt;
-    const blocked = (x, y) => {
-      if (game.world && typeof game.world.collide === 'function') {
-        return game.world.collide(x, y, 18);
-      }
-      return x < 20 || x > WORLD - 20 || y < 20 || y > WORLD - 20;
-    };
-    if (!blocked(nx, ny)) {
-      car.x = nx; car.y = ny;
-    } else if (!blocked(nx, car.y)) {
-      car.x = nx;
-      car.speed *= 0.6; // wall scrape: slide, lose some speed
-    } else if (!blocked(car.x, ny)) {
-      car.y = ny;
-      car.speed *= 0.6;
-    } else {
-      // Fully wedged: reverse straight to unwedge (spec §1).
-      car.speed = -60;
-      car.x += Math.cos(car.angle) * car.speed * dt;
-      car.y += Math.sin(car.angle) * car.speed * dt;
-    }
-    car.x = Math.max(20, Math.min(WORLD - 20, car.x));
-    car.y = Math.max(20, Math.min(WORLD - 20, car.y));
-
-    state.x = car.x;
-    state.y = car.y;
-    state.speed = car.speed;
-    state.driveAngle = car.angle;
-    state.moving = Math.abs(car.speed) > 5;
-    if (game.audio && typeof game.audio.setEngine === 'function') {
-      game.audio.setEngine(Math.abs(car.speed) / topSpeed, true);
+  // The Spray Shop clears heat fast while Rook is inside its radius.
+  const shop = game.sprayShop;
+  if (shop) {
+    const d = Math.hypot(p.x - shop.x, p.y - shop.y);
+    const radius = shop.radius || SPRAY_SHOP_RADIUS;
+    if (d < radius) {
+      p.heat = Math.max(0, p.heat - SPRAY_SHOP_DRAIN * dt);
+      p.stars = computeWantedStars(p.heat);
+      p.hideTimer = 0;
+      return;
     }
   }
 
-  function tryEnterNearby() {
-    const traffic = game.traffic;
-    if (!traffic) return false;
-    // Parked car first (free), then a driven car (carjack).
-    let car = null;
-    let stolen = false;
-    if (typeof traffic.nearestParked === 'function') {
-      car = traffic.nearestParked(state.x, state.y, 70);
-    }
-    if (!car && typeof traffic.nearestDriven === 'function') {
-      car = traffic.nearestDriven(state.x, state.y, 70);
-      stolen = !!car;
-    }
-    if (!car) return false;
-    if (stolen) {
-      if (typeof traffic.carjack === 'function') traffic.carjack(car);
-      // Carjacking is a crime: heat. The police module owns the amount.
-      if (game.police && typeof game.police.addHeat === 'function') game.police.addHeat(8);
-      else if (typeof game.heat === 'number') game.heat = Math.min(100, game.heat + 8);
-      if (game.audio) game.audio.sfx('horn');
-      if (typeof game.onCarjack === 'function') game.onCarjack(car);
-    } else if (typeof traffic.carjack === 'function') {
-      // Take a parked car out of the parked list so it is not double-sold.
-      traffic.carjack(car);
-    }
-    state.car = car;
-    state.onFoot = false;
-    state.speed = 0;
-    if (typeof game.onEnterCar === 'function') game.onEnterCar(car);
-    return true;
+  if (spotlighted) {
+    // A helicopter spotlight on Rook blocks heat decay entirely.
+    p.hideTimer = 0;
+    return;
   }
 
-  function exitCar() {
-    const car = state.car;
-    if (!car) return;
-    state.car = null;
-    state.onFoot = true;
-    // Step out to the side of the car.
-    state.x = car.x + Math.cos(car.angle + Math.PI / 2) * 26;
-    state.y = car.y + Math.sin(car.angle + Math.PI / 2) * 26;
-    state.speed = 0;
-    clampWorld();
-    if (game.audio && typeof game.audio.setEngine === 'function') game.audio.setEngine(0, false);
-    if (typeof game.onExitCar === 'function') game.onExitCar(car);
+  const police = game.police || game.cops || [];
+  let nearestCop = Infinity;
+  for (const cop of police) {
+    if (!cop || cop.dead) continue;
+    const d = Math.hypot(cop.x - p.x, cop.y - p.y);
+    if (d < nearestCop) nearestCop = d;
+  }
+  if (nearestCop > HIDE_DISTANCE) {
+    p.hideTimer += dt;
+    if (p.hideTimer >= HIDE_TIME) {
+      p.heat = Math.max(0, p.heat - HEAT_DECAY_RATE * dt);
+      p.stars = computeWantedStars(p.heat);
+    }
+  } else {
+    p.hideTimer = 0;
+  }
+}
+
+export function damagePlayer(game, amount, source) {
+  const p = game.player;
+  if (!p || !p.alive) return;
+  p.health -= amount;
+  p.damageFlashT = 0.25;
+  if (game.audio && typeof game.audio.playHurt === 'function') {
+    game.audio.playHurt();
+  }
+  if (p.health <= 0) {
+    p.health = 0;
+    p.alive = false;
+    setGameOver(game, 'DOWN');
+  }
+}
+
+export function healPlayer(game, amount) {
+  const p = game.player;
+  if (!p || !p.alive) return;
+  p.health = Math.min(p.maxHealth, p.health + amount);
+}
+
+export function setGameOver(game, reason) {
+  game.gameOver = { reason, at: game.now || 0 };
+  game.state = 'gameover';
+  if (game.audio && typeof game.audio.playGameOver === 'function') {
+    game.audio.playGameOver(reason);
+  }
+}
+
+function checkArrest(game, dt) {
+  const p = game.player;
+  if (!p || !p.alive || !p.onFoot) { if (p) p.arrestTimer = 0; return; }
+  // A foot cop must stay within 30 units of a slow on-foot player for
+  // 1.2 seconds in a row; running away breaks the hold.
+  const slow = p.speed < 100;
+  const police = game.police || game.cops || [];
+  let held = false;
+  if (slow) {
+    for (const cop of police) {
+      if (!cop || cop.dead || cop.kind === 'car') continue;
+      if (Math.hypot(cop.x - p.x, cop.y - p.y) < ARREST_DISTANCE) {
+        held = true;
+        break;
+      }
+    }
+  }
+  if (held) {
+    p.arrestTimer += dt;
+    if (p.arrestTimer >= ARREST_HOLD_TIME) {
+      p.arrestTimer = 0;
+      setGameOver(game, 'CAUGHT');
+    }
+  } else {
+    p.arrestTimer = 0;
+  }
+}
+
+function tryPlayerShoot(game) {
+  const combat = game.combat;
+  if (!combat || typeof combat.fireWeapon !== 'function') return;
+  const input = game.input || {};
+  const aimX = input.aimX ?? input.mouseWorldX ?? null;
+  const aimY = input.aimY ?? input.mouseWorldY ?? null;
+  combat.fireWeapon(game, 'player', aimX, aimY);
+}
+
+function updateOnFoot(game, dt) {
+  const p = game.player;
+  const { mx, my } = readMoveInput(game);
+  const input = game.input || {};
+  p.sprinting = !!(keyDown(game, 'ShiftLeft', 'ShiftRight') || input.sprint) && (mx !== 0 || my !== 0);
+  const targetSpeed = p.sprinting ? PLAYER_SPRINT_SPEED : PLAYER_WALK_SPEED;
+  const accel = 1400;
+  p.vx += (mx * targetSpeed - p.vx) * Math.min(1, accel * dt / targetSpeed);
+  p.vy += (my * targetSpeed - p.vy) * Math.min(1, accel * dt / targetSpeed);
+  p.speed = Math.hypot(p.vx, p.vy);
+
+  // Wall slide: try the full step, then each axis on its own.
+  const nx = p.x + p.vx * dt;
+  const ny = p.y + p.vy * dt;
+  if (!worldBlocked(game, nx, ny)) {
+    p.x = nx; p.y = ny;
+  } else if (!worldBlocked(game, nx, p.y)) {
+    p.x = nx; p.vx = 0;
+  } else if (!worldBlocked(game, p.x, ny)) {
+    p.y = ny; p.vy = 0;
+  } else {
+    p.vx = 0; p.vy = 0;
   }
 
-  return {
-    state,
+  // Aim follows the mouse (world position); without a mouse, face travel.
+  const aimX = input.aimX ?? input.mouseWorldX;
+  const aimY = input.aimY ?? input.mouseWorldY;
+  if (aimX !== undefined && aimY !== undefined && (aimX !== p.x || aimY !== p.y)) {
+    p.angle = Math.atan2(aimY - p.y, aimX - p.x);
+  } else if (p.speed > 20) {
+    p.angle = Math.atan2(p.vy, p.vx);
+  }
 
-    update(dt) {
-      if (state.dead || state.caught) return;
-      state.interactCooldown = Math.max(0, state.interactCooldown - dt);
-      state.hurtCooldown = Math.max(0, state.hurtCooldown - dt);
-      const input = inputNow();
-      if (state.onFoot) updateOnFoot(dt, input);
-      else updateDriving(dt, input);
-      // E: enter / exit a car (on foot) or step out (driving).
-      if (input.interact && state.interactCooldown <= 0) {
-        state.interactCooldown = 0.35;
-        if (state.onFoot) tryEnterNearby();
-        else exitCar();
-      }
-    },
+  if (input.mouseDown || input.mousePressed) tryPlayerShoot(game);
 
-    takeDamage(amount, source) {
-      if (state.dead || state.caught || state.hurtCooldown > 0) return 'alive';
-      // Armor upgrade on the current car resists damage while driving.
-      let dmg = amount;
-      if (!state.onFoot && state.car && state.car.upgrades && state.car.upgrades.armor) {
-        dmg *= Math.max(0.4, 1 - 0.12 * state.car.upgrades.armor);
-      }
-      state.health -= dmg;
-      state.hurtCooldown = 0.12;
-      if (game.audio) game.audio.sfx('crash');
-      if (state.health <= 0) {
-        state.health = 0;
-        return this.die(source === 'arrest' ? 'caught' : 'down');
-      }
-      return 'alive';
-    },
+  if (input.interactPressed || input.ePressed) {
+    if (!game.dialog || !game.dialog.open) tryEnterCar(game);
+  }
+  if (p.damageFlashT > 0) p.damageFlashT -= dt;
+}
 
-    heal(amount) {
-      state.health = Math.min(state.maxHealth, state.health + (amount || 0));
-      return state.health;
-    },
+function nearestUsableCar(game) {
+  const p = game.player;
+  let best = null, bestD = Infinity;
+  for (const car of game.cars || []) {
+    if (!car || car.wrecked || car.player) continue;
+    const d = Math.hypot(car.x - p.x, car.y - p.y);
+    if (d < bestD) { bestD = d; best = car; }
+  }
+  return bestD < CAR_ENTER_DISTANCE ? best : null;
+}
 
-    addCash(n) {
-      state.cash += n;
-      return state.cash;
-    },
+export function tryEnterCar(game) {
+  const p = game.player;
+  if (!p || !p.alive || !p.onFoot) return false;
+  const car = nearestUsableCar(game);
+  if (!car) return false;
+  if (car.driver === 'traffic') {
+    // Carjack: the driver flees on foot, the theft adds heat.
+    carjackDriverFlees(game, car);
+    addHeat(game, 8);
+  } else if (car.parked) {
+    // Stealing a parked car adds heat too.
+    addHeat(game, 5);
+  }
+  car.player = true;
+  car.parked = false;
+  car.driver = 'player';
+  car.route = [];
+  p.car = car;
+  p.onFoot = false;
+  p.x = car.x; p.y = car.y;
+  p.vx = 0; p.vy = 0; p.speed = 0;
+  if (game.audio && typeof game.audio.playCarDoor === 'function') {
+    game.audio.playCarDoor();
+  }
+  return true;
+}
 
-    spendCash(n) {
-      if (state.cash < n) {
-        if (typeof game.onSpendFail === 'function') game.onSpendFail(n);
-        return false;
-      }
-      state.cash -= n;
-      return true;
-    },
+function carjackDriverFlees(game, car) {
+  if (!game.peds) game.peds = [];
+  const away = Math.atan2(car.y - (game.player ? game.player.y : car.y), car.x - (game.player ? game.player.x : car.x));
+  game.peds.push({
+    x: car.x + Math.cos(away + Math.PI / 2) * 30,
+    y: car.y + Math.sin(away + Math.PI / 2) * 30,
+    angle: away,
+    speed: 0,
+    state: 'flee',
+    fleeT: 4,
+    fleeFromX: game.player ? game.player.x : car.x,
+    fleeFromY: game.player ? game.player.y : car.y,
+    color: '#c8b08a',
+    walkSpeed: 150,
+    paired: false,
+  });
+  car.driver = null;
+}
 
-    addHeat(n) {
-      if (game.police && typeof game.police.addHeat === 'function') game.police.addHeat(n);
-      else if (typeof game.heat === 'number') game.heat = Math.min(100, game.heat + n);
-    },
+export function exitCar(game) {
+  const p = game.player;
+  if (!p || p.onFoot || !p.car) return false;
+  const car = p.car;
+  // Step out to the side of the car, clear of its body.
+  const side = car.angle + Math.PI / 2;
+  const px = car.x + Math.cos(side) * 46;
+  const py = car.y + Math.sin(side) * 46;
+  if (!worldBlocked(game, px, py)) {
+    p.x = px; p.y = py;
+  } else {
+    p.x = car.x - Math.cos(side) * 46;
+    p.y = car.y - Math.sin(side) * 46;
+  }
+  p.angle = car.angle;
+  car.player = false;
+  car.parked = true;
+  car.driver = null;
+  car.speed = 0;
+  p.car = null;
+  p.onFoot = true;
+  p.vx = 0; p.vy = 0; p.speed = 0;
+  if (game.audio && typeof game.audio.playCarDoor === 'function') {
+    game.audio.playCarDoor();
+  }
+  return true;
+}
 
-    wantedStars,
+function updateDriving(game, dt) {
+  const p = game.player;
+  const car = p.car;
+  if (!car) { p.onFoot = true; return; }
+  const input = game.input || {};
 
-    enterCar(car) {
-      if (!car) return false;
-      state.car = car;
-      state.onFoot = false;
-      return true;
-    },
+  // The autopilot drove this frame: never brake it back with manual input.
+  if (game.autopilotDrove) {
+    p.x = car.x; p.y = car.y;
+    p.angle = car.angle;
+    p.speed = Math.abs(car.speed);
+    return;
+  }
 
-    exitCar,
-    tryEnterNearby,
+  let throttle = 0;
+  if (keyDown(game, 'KeyW', 'ArrowUp') || input.up) throttle += 1;
+  if (keyDown(game, 'KeyS', 'ArrowDown') || input.down) throttle -= 1;
+  let steer = 0;
+  if (keyDown(game, 'KeyA', 'ArrowLeft') || input.left) steer -= 1;
+  if (keyDown(game, 'KeyD', 'ArrowRight') || input.right) steer += 1;
+  const handbrake = !!(keyDown(game, 'Space') || input.handbrake);
+  applyCarPhysics(car, { throttle, steer, handbrake }, dt, game.world, game.now || 0);
 
-    die(cause) {
-      if (cause === 'caught') {
-        state.caught = true;
-        if (game.audio) game.audio.sfx('arrest');
-        if (typeof game.onPlayerCaught === 'function') game.onPlayerCaught();
-        return 'caught';
-      }
-      state.dead = true;
-      if (game.audio) game.audio.sfx('fail');
-      if (typeof game.onPlayerDown === 'function') game.onPlayerDown();
-      return 'down';
-    },
+  p.x = car.x; p.y = car.y;
+  p.angle = car.angle;
+  p.speed = Math.abs(car.speed);
+  if (car.wrecked) {
+    exitCar(game);
+    return;
+  }
+  if (input.interactPressed || input.ePressed) exitCar(game);
+  if (p.damageFlashT > 0) p.damageFlashT -= dt;
+}
 
-    reset(x, y) {
-      state.x = x === undefined ? 600 : x;
-      state.y = y === undefined ? 600 : y;
-      state.angle = 0;
-      state.aimAngle = 0;
-      state.health = state.maxHealth;
-      state.cash = 0;
-      state.onFoot = true;
-      state.car = null;
-      state.speed = 0;
-      state.dead = false;
-      state.caught = false;
-      state.interactCooldown = 0;
-      state.hurtCooldown = 0;
-      return state;
-    },
-  };
+export function updatePlayer(game, dt) {
+  const p = game.player;
+  if (!p || !p.alive) return;
+  if (game.state && game.state !== 'playing') return;
+  updatePlayerHeat(game, dt);
+  if (p.onFoot) updateOnFoot(game, dt);
+  else updateDriving(game, dt);
+  checkArrest(game, dt);
+  if (p.health <= 0 && p.alive) {
+    p.alive = false;
+    setGameOver(game, 'DOWN');
+  }
 }
