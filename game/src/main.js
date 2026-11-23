@@ -415,7 +415,28 @@ function rebuildMissionArc() {
 
 function missionDef(id) {
   if (!id) return null;
-  return missionArcById[id] || MISSION_FALLBACK_PLAN[id] || null;
+  const mod = missionArcById[id] || null;
+  if (mod) {
+    // The Act 2 entries describe their stages by label only (no kind,
+    // landmark or coordinates), which the fallback driver cannot run:
+    // a goto stage with no target never completes — the m9 probe
+    // watched the car arrive at the hideout and sit there 140+ s
+    // with game.missionTarget null while the autopilot (which carries
+    // its own plan) had driven to the right place. When a module
+    // entry cannot drive, the spec fallback plan for that mission
+    // wins: it carries the same rewards and limits plus the stage
+    // kinds, landmarks, cover heat and helicopter the driver needs.
+    // Entries whose stages do carry a kind, a landmark or coordinates
+    // (m1–m8) are untouched.
+    const stages = mod.stages || mod.checkpoints || null;
+    const usable = Array.isArray(stages) && stages.some((s) => s
+      && (s.kind || s.landmark || (s.target && typeof s.target.x === 'number')
+        || (typeof s.x === 'number' && typeof s.y === 'number')));
+    if (usable) return mod;
+    if (MISSION_FALLBACK_PLAN[id]) return MISSION_FALLBACK_PLAN[id];
+    return mod;
+  }
+  return MISSION_FALLBACK_PLAN[id] || null;
 }
 
 function nextMissionId(id) {
