@@ -204,18 +204,41 @@ export function createAutopilot(game) {
 
   // ---- input helpers (the same inputs a human uses) -----------------
 
+  // Press E the way a human does: a tap, not a held key. The old
+  // version added KeyE to the held-key set and never released it, so
+  // the edge fired exactly once and KeyE stayed "held" forever — and
+  // the sticky interactPressed boolean it also set made the driving
+  // update exit any car the autopilot had just entered, in the same
+  // frame (enter, then exit, 60 times a second, frozen at the exit
+  // spot 46 units from the car). A tap leaves the edge visible for
+  // the rest of this frame and the held set clean for the next press.
   function pressInteract() {
     const input = inputObj();
     if (!input) return;
     input.interactPressed = true;
     input.ePressed = true;
-    if (input.keys && typeof input.keys.add === 'function') input.keys.add('KeyE');
     if (typeof input.press === 'function') {
       try { input.press('KeyE'); } catch (e) { /* ignore */ }
+    }
+    if (typeof input.release === 'function') {
+      try { input.release('KeyE'); } catch (e) { /* ignore */ }
     }
     if (game && typeof game.acceptDialog === 'function') {
       try { game.acceptDialog(); } catch (e) { /* ignore */ }
     }
+  }
+
+  // Clear the interact edge the tap above raised. Needed after a
+  // DIRECT car enter (tryEnterCar in the step functions below): the
+  // enter already happened, and if the edge is still raised when the
+  // driving update runs later in this same frame, it reads the edge
+  // as "exit the car" and undoes the enter at once. Dialog accepts
+  // do NOT clear it — the dialog branch below needs the edge.
+  function clearInteractEdge() {
+    const input = inputObj();
+    if (!input) return;
+    input.interactPressed = false;
+    input.ePressed = false;
   }
 
   function setMove(dx, dy, sprint) {
@@ -248,7 +271,7 @@ export function createAutopilot(game) {
     // setMove). Clearing the Shift keys releases the sprint instead.
     input.mouseDown = false;
     if (input.keys && typeof input.keys.delete === 'function') {
-      for (const k of ['KeyA', 'KeyD', 'KeyW', 'KeyS', 'ShiftLeft', 'ShiftRight']) input.keys.delete(k);
+      for (const k of ['KeyA', 'KeyD', 'KeyW', 'KeyS', 'ShiftLeft', 'ShiftRight', 'KeyE']) input.keys.delete(k);
     }
   }
 
@@ -979,6 +1002,9 @@ export function createAutopilot(game) {
       clearMove();
       pressInteract();
       tryEnterCar(game);
+      // The enter already happened: drop the edge before the driving
+      // update runs, or it reads "exit the car" in the same frame.
+      clearInteractEdge();
       state.carSwapTarget = null;
       return;
     }
@@ -1049,6 +1075,9 @@ export function createAutopilot(game) {
         clearMove();
         pressInteract();
         tryEnterCar(game);
+        // The enter already happened: drop the edge before the
+        // driving update runs, or it exits the car in the same frame.
+        clearInteractEdge();
         return;
       }
       if (choice) {
