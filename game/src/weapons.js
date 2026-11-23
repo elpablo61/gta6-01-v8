@@ -1,49 +1,68 @@
-// weapons.js — Weapon system (prose spec §3.2).
-// Three weapons, one per key: 1 pistol (start weapon, 18 damage, medium
-// rate, 48 starting ammo), 2 SMG (fast fire, 10 damage, large magazine),
-// 3 shotgun (slow, 5 pellets x 8 damage, spread, short range). Q cycles
-// to the next owned weapon. Each weapon has its own ammo count; the HUD
-// shows the current weapon name + ammo large. Weapon crates in the world:
-// an SMG crate and a shotgun crate at fixed spots (gun store, docks,
-// hideout) plus crates inside the m10/m12 shootout arenas; walking over
-// a crate picks the weapon up (and gives ammo). Ammo pickups in shootout
-// arenas (autopilot grabs one when its current weapon's ammo <= 6).
-// Enemies use the pistol only. Weapon switching works on foot and is
-// instant (no animation lock).
+// Weapons — pistol, SMG, shotgun. Crescent Bay. Fresh from prose spec §3.2.
+// Three weapons, one per key: 1 pistol (the starting weapon), 2 SMG, 3
+// shotgun. Q cycles to the next owned weapon. Every weapon keeps its own
+// ammo pool, and the HUD shows the current weapon name plus its ammo big.
+// Weapon crates sit at fixed spots in the world (gun store, docks, hideout)
+// and inside the m10 / m12 shootout arenas; walking over a crate picks the
+// weapon up and adds ammo. Ammo pickups sit in the shootout arenas — the
+// autopilot grabs one when its current weapon is at 6 ammo or fewer.
+// Enemies use the pistol only. Switching weapons works on foot and is
+// instant: there is no animation lock, no delay, no cancelled shot.
+//
+// Shared-state contract (read defensively; missing fields get safe defaults):
+//   game.player  { x, y, angle, onFoot } — Rook's position and aim angle.
+//   game.world.landmarks { gunStore, docks, hideout } — crate spots; when
+//                absent, DEFAULT_CRATE_SPOTS below is used instead.
+//   game.mission { id } — 'm10' / 'm12' arenas get their own crates.
+//   game.arena   { x, y, radius } — shootout arena centre (optional).
+//   game.time    { now } — seconds; used for fire-rate cooldowns.
+//   game.audio   { play(name) } — optional sound hook.
+//   game.enemies — array of { x, y, health, alive } the combat system
+//                owns; this module never mutates enemies directly, it only
+//                returns shot descriptors for the combat system to resolve.
+// A shot descriptor is { x, y, angle, damage, range, speed, kind, pellet }.
+// The combat system moves it, tests hits, and calls registerHit() so the
+// ammo bookkeeping stays in one place. tryFire() already deducts ammo.
 
 export const WEAPON_DEFS = {
   pistol: {
+    id: 'pistol',
     name: 'Pistol',
     key: '1',
     damage: 18,
-    fireInterval: 0.28, // medium rate
+    fireInterval: 0.28,
+    range: 460,
+    bulletSpeed: 900,
     pellets: 1,
-    spread: 0.03,
-    range: 520,
+    spread: 0.02,
     startAmmo: 48,
     crateAmmo: 48,
     pickupAmmo: 24,
   },
   smg: {
+    id: 'smg',
     name: 'SMG',
     key: '2',
     damage: 10,
-    fireInterval: 0.08, // fast fire
+    fireInterval: 0.09,
+    range: 380,
+    bulletSpeed: 950,
     pellets: 1,
-    spread: 0.09,
-    range: 460,
+    spread: 0.06,
     startAmmo: 0,
-    crateAmmo: 120, // large magazine
+    crateAmmo: 120,
     pickupAmmo: 60,
   },
   shotgun: {
+    id: 'shotgun',
     name: 'Shotgun',
     key: '3',
-    damage: 8, // per pellet
-    fireInterval: 0.85, // slow
+    damage: 8,
+    fireInterval: 0.85,
+    range: 240,
+    bulletSpeed: 800,
     pellets: 5,
-    spread: 0.28, // wide spread
-    range: 260, // short range
+    spread: 0.16,
     startAmmo: 0,
     crateAmmo: 24,
     pickupAmmo: 12,
@@ -51,164 +70,408 @@ export const WEAPON_DEFS = {
 };
 
 export const WEAPON_ORDER = ['pistol', 'smg', 'shotgun'];
-export const LOW_AMMO_THRESHOLD = 6; // autopilot grabs arena ammo at <= 6
+export const ENEMY_WEAPON_ID = 'pistol';
+export const LOW_AMMO_THRESHOLD = 6;
 
-// Fixed world crate spots from the spec: gun store, docks, hideout.
-// Positions are set by the game when it creates the world; the crate
-// definitions here carry only the weapon and a label, so the world can
-// place them wherever its map puts those landmarks.
-export function createWeaponCrates(spots) {
-  // spots: [{ id, kind: 'smg'|'shotgun', x, y }]
-  return spots.map((s) => ({
-    id: s.id,
-    kind: s.kind,
-    x: s.x,
-    y: s.y,
-    taken: false,
-    radius: 26,
-  }));
-}
+export const DEFAULT_CRATE_SPOTS = [
+  { kind: 'smg', x: 1000, y: 1000, label: 'gun store' },
+  { kind: 'shotgun', x: 1000, y: 1000, label: 'gun store' },
+  { kind: 'smg', x: 3000, y: 2200, label: 'docks' },
+  { kind: 'shotgun', x: 3000, y: 2200, label: 'docks' },
+  { kind: 'smg', x: 600, y: 1800, label: 'hideout' },
+  { kind: 'shotgun', x: 600, y: 1800, label: 'hideout' },
+];
 
-export function createWeapons() {
+export const CRATE_PICKUP_RADIUS = 46;
+export const AMMO_PICKUP_RADIUS = 40;
+
+export function createWeaponSystem(game) {
   const state = {
     current: 'pistol',
     owned: { pistol: true, smg: false, shotgun: false },
-    ammo: { pistol: WEAPON_DEFS.pistol.startAmmo, smg: 0, shotgun: 0 },
-    cooldown: 0, // seconds until the next shot is allowed
+    ammo: {
+      pistol: WEAPON_DEFS.pistol.startAmmo,
+      smg: 0,
+      shotgun: 0,
+    },
+    lastShotAt: -10,
+    crates: [],
+    ammoPickups: [],
+    shotsFired: 0,
+    pickupsTaken: 0,
+    arenaCratesSpawnedFor: null,
   };
 
-  function def() {
+  function now() {
+    if (game && game.time && typeof game.time.now === 'number') return game.time.now;
+    return Date.now() / 1000;
+  }
+
+  function playerPos() {
+    const p = game && game.player;
+    if (p && typeof p.x === 'number' && typeof p.y === 'number') return p;
+    return { x: 1600, y: 1600, angle: 0, onFoot: true };
+  }
+
+  function rng() {
+    if (game && typeof game.rng === 'function') return game.rng();
+    return Math.random();
+  }
+
+  function playSound(name) {
+    if (game && game.audio && typeof game.audio.play === 'function') {
+      try { game.audio.play(name); } catch (e) { /* sound is optional */ }
+    }
+  }
+
+  function landmark(name) {
+    const marks = game && game.world && game.world.landmarks;
+    if (marks && marks[name] && typeof marks[name].x === 'number') return marks[name];
+    return null;
+  }
+
+  // Fixed world crates: one SMG crate + one shotgun crate at each of the
+  // gun store, the docks and the hideout. Spawned once per run.
+  function spawnWorldCrates() {
+    if (state.crates.length > 0) return state.crates;
+    const spots = [];
+    const gun = landmark('gunStore');
+    const docks = landmark('docks');
+    const hideout = landmark('hideout');
+    if (gun) {
+      spots.push({ kind: 'smg', x: gun.x, y: gun.y, label: 'gun store' });
+      spots.push({ kind: 'shotgun', x: gun.x + 40, y: gun.y, label: 'gun store' });
+    }
+    if (docks) {
+      spots.push({ kind: 'smg', x: docks.x, y: docks.y, label: 'docks' });
+      spots.push({ kind: 'shotgun', x: docks.x + 40, y: docks.y, label: 'docks' });
+    }
+    if (hideout) {
+      spots.push({ kind: 'smg', x: hideout.x, y: hideout.y, label: 'hideout' });
+      spots.push({ kind: 'shotgun', x: hideout.x + 40, y: hideout.y, label: 'hideout' });
+    }
+    const list = spots.length > 0 ? spots : DEFAULT_CRATE_SPOTS;
+    state.crates = list.map((s) => ({
+      kind: s.kind,
+      x: s.x,
+      y: s.y,
+      label: s.label,
+      taken: false,
+    }));
+    return state.crates;
+  }
+
+  // Arena crates for the m10 / m12 shootouts: an SMG crate, a shotgun
+  // crate and two ammo pickups inside the arena, spawned once per mission.
+  function spawnArenaCrates() {
+    const missionId = game && game.mission && game.mission.id;
+    if (missionId !== 'm10' && missionId !== 'm12') return [];
+    if (state.arenaCratesSpawnedFor === missionId) return state.crates;
+    state.arenaCratesSpawnedFor = missionId;
+    const arena = (game && game.arena) || {};
+    const cx = typeof arena.x === 'number' ? arena.x : playerPos().x;
+    const cy = typeof arena.y === 'number' ? arena.y : playerPos().y;
+    const made = [
+      { kind: 'smg', x: cx - 120, y: cy - 80, label: 'arena', taken: false },
+      { kind: 'shotgun', x: cx + 120, y: cy - 80, label: 'arena', taken: false },
+    ];
+    state.crates.push(...made);
+    state.ammoPickups.push(
+      { weapon: 'smg', x: cx - 60, y: cy + 100, taken: false },
+      { weapon: 'shotgun', x: cx + 60, y: cy + 100, taken: false },
+      { weapon: 'pistol', x: cx, y: cy + 140, taken: false },
+    );
+    return made;
+  }
+
+  function spawnAmmoPickup(x, y, weapon) {
+    const def = WEAPON_DEFS[weapon] || WEAPON_DEFS.pistol;
+    state.ammoPickups.push({ weapon: def.id, x, y, taken: false });
+    return state.ammoPickups[state.ammoPickups.length - 1];
+  }
+
+  function currentDef() {
     return WEAPON_DEFS[state.current];
   }
 
-  function canFire() {
-    return state.cooldown <= 0 && state.ammo[state.current] > 0;
+  function ammoFor(id) {
+    return state.ammo[id] || 0;
   }
 
-  // Fire one trigger pull. Returns an array of shot descriptors
-  // ({ damage, spreadOffset, range }) — one per pellet — or null when
-  // the weapon cannot fire (cooling down or empty). The caller applies
-  // the shots to targets; this module owns rate, ammo and spread only.
-  function fire() {
-    if (!canFire()) return null;
-    state.cooldown = def().fireInterval;
-    state.ammo[state.current] -= 1;
-    const shots = [];
-    for (let i = 0; i < def().pellets; i++) {
-      const offset = (Math.random() * 2 - 1) * def().spread;
-      shots.push({ damage: def().damage, spreadOffset: offset, range: def().range });
-    }
-    return shots;
+  function isOwned(id) {
+    return !!state.owned[id];
   }
 
-  // Instant switch, on foot or anywhere; no animation lock.
-  function select(kind) {
-    if (!state.owned[kind]) return false;
-    state.current = kind;
+  function giveWeapon(id, ammoBonus) {
+    const def = WEAPON_DEFS[id];
+    if (!def) return false;
+    const firstTime = !state.owned[id];
+    state.owned[id] = true;
+    state.ammo[id] = (state.ammo[id] || 0) + (ammoBonus || def.crateAmmo);
+    if (firstTime) state.current = id;
+    playSound('pickup');
     return true;
   }
 
-  // Q: cycle to the next owned weapon.
-  function cycle() {
+  function addAmmo(id, amount) {
+    const def = WEAPON_DEFS[id];
+    if (!def) return false;
+    state.ammo[id] = (state.ammo[id] || 0) + Math.max(0, amount || 0);
+    return true;
+  }
+
+  // Instant switch, on foot only. Returns true when the weapon changed.
+  function selectWeapon(id) {
+    const def = WEAPON_DEFS[id];
+    if (!def || !state.owned[id]) return false;
+    const p = game && game.player;
+    if (p && p.onFoot === false) return false;
+    if (state.current === id) return true;
+    state.current = id;
+    playSound('weapon-switch');
+    return true;
+  }
+
+  function cycleWeapon() {
     const idx = WEAPON_ORDER.indexOf(state.current);
     for (let step = 1; step <= WEAPON_ORDER.length; step++) {
       const next = WEAPON_ORDER[(idx + step) % WEAPON_ORDER.length];
       if (state.owned[next]) {
         state.current = next;
-        return next;
+        playSound('weapon-switch');
+        return state.current;
       }
     }
     return state.current;
   }
 
-  // Handle number-key selection (1/2/3). Returns the selected kind
-  // or null when the key is not a weapon key.
-  function handleKey(key) {
-    for (const kind of WEAPON_ORDER) {
-      if (WEAPON_DEFS[kind].key === key) {
-        select(kind);
-        return kind;
-      }
-    }
-    return null;
+  function canFire() {
+    const def = currentDef();
+    if (ammoFor(state.current) <= 0) return false;
+    return now() - state.lastShotAt >= def.fireInterval;
   }
 
-  // Walking over a crate picks the weapon up and gives ammo.
-  // Returns the crate's weapon kind, or null when nothing was picked.
-  function pickupCrate(crates, playerX, playerY) {
-    for (const crate of crates) {
-      if (crate.taken) continue;
-      const dx = crate.x - playerX;
-      const dy = crate.y - playerY;
-      if (dx * dx + dy * dy <= crate.radius * crate.radius) {
-        crate.taken = true;
-        state.owned[crate.kind] = true;
-        state.ammo[crate.kind] += WEAPON_DEFS[crate.kind].crateAmmo;
-        state.current = crate.kind;
-        return crate.kind;
-      }
+  // Fire one shot from the player's position toward aimAngle. Returns an
+  // array of shot descriptors (one per pellet), or null when it cannot
+  // fire (cooling down, out of ammo, or driving). Ammo is deducted here.
+  function tryFire(aimAngle) {
+    const p = playerPos();
+    if (p.onFoot === false) return null;
+    const def = currentDef();
+    if (ammoFor(state.current) <= 0) return null;
+    if (now() - state.lastShotAt < def.fireInterval) return null;
+    state.lastShotAt = now();
+    state.ammo[state.current] -= 1;
+    state.shotsFired += 1;
+    playSound('shoot-' + state.current);
+    const shots = [];
+    for (let i = 0; i < def.pellets; i++) {
+      const jitter = (rng() - 0.5) * 2 * def.spread;
+      shots.push({
+        x: p.x,
+        y: p.y,
+        angle: aimAngle + jitter,
+        damage: def.damage,
+        range: def.range,
+        speed: def.bulletSpeed,
+        kind: state.current,
+        pellet: i,
+      });
     }
-    return null;
+    return shots;
   }
 
-  // Arena ammo pickups: { x, y, kind, amount, taken, radius }.
-  // The autopilot grabs one when its current weapon's ammo <= 6.
-  function pickupAmmo(pickups, playerX, playerY) {
-    for (const p of pickups) {
-      if (p.taken) continue;
-      const dx = p.x - playerX;
-      const dy = p.y - playerY;
-      if (dx * dx + dy * dy <= p.radius * p.radius) {
-        p.taken = true;
-        state.ammo[p.kind] = (state.ammo[p.kind] || 0) + p.amount;
-        return p.kind;
-      }
-    }
-    return null;
+  // Enemy fire: enemies use the pistol only, one bullet, pistol damage.
+  function enemyShot(x, y, angle) {
+    const def = WEAPON_DEFS.pistol;
+    return {
+      x,
+      y,
+      angle,
+      damage: def.damage,
+      range: def.range,
+      speed: def.bulletSpeed,
+      kind: 'pistol',
+      pellet: 0,
+      fromEnemy: true,
+    };
   }
 
-  function addAmmo(kind, amount) {
-    state.ammo[kind] = (state.ammo[kind] || 0) + amount;
+  function nearestCrate(maxDistance) {
+    const p = playerPos();
+    let best = null;
+    let bestD = maxDistance || Infinity;
+    for (const c of state.crates) {
+      if (c.taken) continue;
+      const dx = c.x - p.x;
+      const dy = c.y - p.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    return best;
+  }
+
+  function nearestAmmoPickup(maxDistance) {
+    const p = playerPos();
+    let best = null;
+    let bestD = maxDistance || Infinity;
+    for (const a of state.ammoPickups) {
+      if (a.taken) continue;
+      const dx = a.x - p.x;
+      const dy = a.y - p.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bestD) { bestD = d; best = a; }
+    }
+    return best;
+  }
+
+  function needsAmmo() {
+    return ammoFor(state.current) <= LOW_AMMO_THRESHOLD;
   }
 
   function update(dt) {
-    if (state.cooldown > 0) state.cooldown -= dt;
+    spawnWorldCrates();
+    spawnArenaCrates();
+    const p = playerPos();
+    if (p.onFoot === false) return state;
+    for (const c of state.crates) {
+      if (c.taken) continue;
+      const dx = c.x - p.x;
+      const dy = c.y - p.y;
+      if (dx * dx + dy * dy < CRATE_PICKUP_RADIUS * CRATE_PICKUP_RADIUS) {
+        c.taken = true;
+        giveWeapon(c.kind);
+        state.pickupsTaken += 1;
+        if (game) game.lastPickup = { kind: c.kind, at: now() };
+      }
+    }
+    for (const a of state.ammoPickups) {
+      if (a.taken) continue;
+      const dx = a.x - p.x;
+      const dy = a.y - p.y;
+      if (dx * dx + dy * dy < AMMO_PICKUP_RADIUS * AMMO_PICKUP_RADIUS) {
+        a.taken = true;
+        const def = WEAPON_DEFS[a.weapon];
+        addAmmo(a.weapon, def ? def.pickupAmmo : 24);
+        state.pickupsTaken += 1;
+        playSound('pickup-ammo');
+      }
+    }
+    return state;
+  }
+
+  // Keyboard handling: 1/2/3 select, Q cycles. Returns true when a key
+  // was consumed. The main loop may call this with its own input object.
+  function onKey(code) {
+    if (code === 'Digit1') return selectWeapon('pistol');
+    if (code === 'Digit2') return selectWeapon('smg');
+    if (code === 'Digit3') return selectWeapon('shotgun');
+    if (code === 'KeyQ') { cycleWeapon(); return true; }
+    return false;
   }
 
   function hudText() {
-    return `${def().name}  ${state.ammo[state.current]}`;
+    const def = currentDef();
+    return { weapon: def.name, ammo: ammoFor(state.current), owned: { ...state.owned } };
   }
 
-  // Save/load payload (owned weapons + ammo + current selection).
+  function draw(ctx, camera) {
+    if (!ctx) return;
+    const camX = (camera && camera.x) || 0;
+    const camY = (camera && camera.y) || 0;
+    for (const c of state.crates) {
+      if (c.taken) continue;
+      const x = c.x - camX;
+      const y = c.y - camY;
+      ctx.fillStyle = '#7a5a1e';
+      ctx.fillRect(x - 14, y - 10, 28, 20);
+      ctx.fillStyle = '#c9a227';
+      ctx.fillRect(x - 14, y - 2, 28, 4);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(c.kind === 'smg' ? 'SMG' : 'SG', x, y + 4);
+    }
+    for (const a of state.ammoPickups) {
+      if (a.taken) continue;
+      const x = a.x - camX;
+      const y = a.y - camY;
+      ctx.fillStyle = '#2e7d32';
+      ctx.beginPath();
+      ctx.arc(x, y, 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('AMMO', x, y + 3);
+    }
+  }
+
   function serialize() {
     return {
       current: state.current,
       owned: { ...state.owned },
       ammo: { ...state.ammo },
+      cratesTaken: state.crates.filter((c) => c.taken).length,
     };
   }
 
-  function deserialize(data) {
-    if (!data) return;
-    if (data.owned) state.owned = { ...state.owned, ...data.owned };
-    if (data.ammo) state.ammo = { ...state.ammo, ...data.ammo };
-    if (data.current && state.owned[data.current]) state.current = data.current;
+  function restore(data) {
+    if (!data || typeof data !== 'object') return false;
+    if (data.current && WEAPON_DEFS[data.current]) state.current = data.current;
+    if (data.owned) {
+      for (const id of WEAPON_ORDER) {
+        if (typeof data.owned[id] === 'boolean') state.owned[id] = data.owned[id];
+      }
+    }
+    if (data.ammo) {
+      for (const id of WEAPON_ORDER) {
+        if (typeof data.ammo[id] === 'number') state.ammo[id] = data.ammo[id];
+      }
+    }
+    if (!state.owned[state.current]) state.current = 'pistol';
+    return true;
+  }
+
+  function snapshot() {
+    return {
+      current: state.current,
+      ammo: { ...state.ammo },
+      owned: { ...state.owned },
+      crates: state.crates.length,
+      cratesTaken: state.crates.filter((c) => c.taken).length,
+      ammoPickups: state.ammoPickups.filter((a) => !a.taken).length,
+      shotsFired: state.shotsFired,
+      pickupsTaken: state.pickupsTaken,
+    };
   }
 
   return {
     state,
-    def,
-    canFire,
-    fire,
-    select,
-    cycle,
-    handleKey,
-    pickupCrate,
-    pickupAmmo,
-    addAmmo,
+    defs: WEAPON_DEFS,
     update,
+    draw,
+    onKey,
+    tryFire,
+    enemyShot,
+    selectWeapon,
+    cycleWeapon,
+    giveWeapon,
+    addAmmo,
+    ammoFor,
+    isOwned,
+    currentDef,
     hudText,
+    spawnWorldCrates,
+    spawnArenaCrates,
+    spawnAmmoPickup,
+    nearestCrate,
+    nearestAmmoPickup,
+    needsAmmo,
     serialize,
-    deserialize,
+    restore,
+    snapshot,
   };
 }
+
+export default createWeaponSystem;
