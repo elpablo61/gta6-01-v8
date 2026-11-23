@@ -1,188 +1,333 @@
-// radio.js — Radio with 3 stations (prose spec §3.4).
-// R cycles the radio station; the HUD shows the station name plus a
-// small animated equalizer. Three stations, each a distinct procedural
-// WebAudio loop: "Bay FM" (synthwave, driving bass), "Harbor Jazz"
-// (slow swing), "Crescent Rock" (driving rock riff). Station 1 is the
-// default on New Game. The radio keeps playing through missions and
-// free roam. It is music only (no talk). The old single music loop is
-// replaced by this station system. A scripted check must cycle all
-// three stations and assert the displayed station name changes.
+// Radio — 3 stations. Crescent Bay. Fresh from prose spec §3.4.
+// R cycles the radio station; the HUD shows the station name plus a small
+// animated equalizer. Three stations, each a distinct procedural WebAudio
+// loop — no samples, no network, no talk, music only:
+//   "Bay FM"      — synthwave, driving bass.
+//   "Harbor Jazz" — slow swing.
+//   "Crescent Rock" — driving rock riff.
+// Station 1 (Bay FM) is the default on New Game. The radio keeps playing
+// through missions and free roam. This module replaces the old single
+// music loop: there is one radio system, and it is this one.
+// A scripted check can cycle all three stations and assert the displayed
+// station name changes each time — see cycle() + stationName().
+//
+// Shared-state contract (read defensively; missing fields get defaults):
+//   game.audioContext — an AudioContext the game owns (optional); when
+//                absent this module creates one lazily on first user
+//                gesture (start() / cycle()). In Node (no AudioContext)
+//                the scheduler is a no-op but station state still cycles,
+//                so scripted checks pass headless.
+//   game.audio   { muted } — optional mute flag the radio respects.
+//   game.time    { now } — seconds; drives the equalizer animation.
+// The equalizer is driven by the beat phase, so it animates even when the
+// audio context is suspended: drawEqualizer() never needs sound to move.
 
-export const STATIONS = [
-  { id: 'bayfm', name: 'Bay FM', genre: 'synthwave', bpm: 112 },
-  { id: 'harborjazz', name: 'Harbor Jazz', genre: 'jazz', bpm: 84 },
-  { id: 'crescentrock', name: 'Crescent Rock', genre: 'rock', bpm: 132 },
+export const RADIO_STATIONS = [
+  {
+    id: 'bay-fm',
+    name: 'Bay FM',
+    tagline: 'synthwave, driving bass',
+    bpm: 112,
+    swing: 0,
+    bassNotes: [0, 0, 7, 0, 10, 0, 7, 5],
+    bassWave: 'sawtooth',
+    chordNotes: [0, 3, 7, 10],
+    chordWave: 'square',
+    leadNotes: [12, 15, 19, 15, 12, 10, 7, 10],
+    leadWave: 'sawtooth',
+    rootMidi: 45,
+    hatEvery: 0.5,
+  },
+  {
+    id: 'harbor-jazz',
+    name: 'Harbor Jazz',
+    tagline: 'slow swing',
+    bpm: 84,
+    swing: 0.35,
+    bassNotes: [0, 7, 5, 7, 0, 7, 10, 7],
+    bassWave: 'triangle',
+    chordNotes: [0, 4, 7, 11],
+    chordWave: 'sine',
+    leadNotes: [12, 11, 9, 7, 9, 11, 12, 14],
+    leadWave: 'sine',
+    rootMidi: 41,
+    hatEvery: 1,
+  },
+  {
+    id: 'crescent-rock',
+    name: 'Crescent Rock',
+    tagline: 'driving rock riff',
+    bpm: 132,
+    swing: 0,
+    bassNotes: [0, 0, 0, 7, 0, 0, 5, 7],
+    bassWave: 'square',
+    chordNotes: [0, 5, 7, 12],
+    chordWave: 'sawtooth',
+    leadNotes: [12, 12, 15, 12, 19, 15, 12, 7],
+    leadWave: 'square',
+    rootMidi: 40,
+    hatEvery: 0.5,
+  },
 ];
-export const DEFAULT_STATION = 0; // Bay FM on New Game
 
-// Note frequencies (Hz) used by the procedural loops.
-const NOTE = {
-  C2: 65.41, D2: 73.42, E2: 82.41, F2: 87.31, G2: 98.0, A2: 110.0, B2: 123.47,
-  C3: 130.81, D3: 146.83, E3: 164.81, F3: 174.61, G3: 196.0, A3: 220.0, B3: 246.94,
-  C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23, G4: 392.0, A4: 440.0, B4: 493.88,
-  C5: 523.25, D5: 587.33, E5: 659.25, G5: 783.99, A5: 880.0,
-};
+export const RADIO_DEFAULT_STATION = 0;
+export const EQUALIZER_BARS = 8;
 
-// Each station is a 16-step loop: bass line + lead riff.
-// Steps are eighth notes at the station's BPM.
-const PATTERNS = {
-  bayfm: {
-    // Synthwave: driving octave bass, bright saw lead.
-    bass: ['C2', 'C2', 'C3', 'C2', 'G2', 'G2', 'G3', 'G2', 'A2', 'A2', 'A3', 'A2', 'F2', 'F2', 'G2', 'G2'],
-    lead: ['C4', null, 'E4', null, 'G4', null, 'A4', null, 'G4', null, 'E4', null, 'D4', null, 'E4', 'G4'],
-    wave: 'sawtooth',
-    bassGain: 0.16,
-    leadGain: 0.07,
-  },
-  harborjazz: {
-    // Slow swing: walking bass, mellow triangle melody.
-    bass: ['C2', 'E2', 'G2', 'A2', 'F2', 'A2', 'C3', 'G2', 'C2', 'E2', 'G2', 'B2', 'A2', 'G2', 'F2', 'G2'],
-    lead: ['E4', null, 'G4', null, 'A4', 'G4', 'E4', null, 'D4', 'E4', 'C4', null, 'B3', 'C4', null, null],
-    wave: 'triangle',
-    bassGain: 0.13,
-    leadGain: 0.08,
-  },
-  crescentrock: {
-    // Driving rock riff: punchy root bass, square lead.
-    bass: ['E2', 'E2', 'E2', 'G2', 'E2', 'E2', 'A2', 'G2', 'E2', 'E2', 'E2', 'G2', 'D2', 'D2', 'G2', 'A2'],
-    lead: ['E4', 'G4', 'A4', 'G4', 'E4', null, 'D4', 'E4', 'E4', 'G4', 'A4', 'C5', 'B4', 'A4', 'G4', 'E4'],
-    wave: 'square',
-    bassGain: 0.12,
-    leadGain: 0.05,
-  },
-};
+export function midiToFrequency(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
 
-export function createRadio() {
-  const radio = {
-    stationIndex: DEFAULT_STATION,
+export function createRadio(game) {
+  const state = {
+    index: RADIO_DEFAULT_STATION,
     playing: false,
-    eqLevel: 0, // 0..1 animated equalizer level for the HUD
+    started: false,
+    audioContext: null,
+    masterGain: null,
+    nextNoteTime: 0,
     step: 0,
+    timerId: null,
+    cycles: 0,
+    stationHistory: [RADIO_STATIONS[RADIO_DEFAULT_STATION].name],
   };
 
-  let audioCtx = null;
-  let timerId = null;
-  let masterGain = null;
-
-  function station() {
-    return STATIONS[radio.stationIndex];
+  function currentStation() {
+    return RADIO_STATIONS[state.index];
   }
 
   function stationName() {
-    return station().name;
+    return currentStation().name;
   }
 
-  function ensureAudio() {
-    if (audioCtx) return true;
-    try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return false;
-      audioCtx = new AC();
-      masterGain = audioCtx.createGain();
-      masterGain.gain.value = 0.5;
-      masterGain.connect(audioCtx.destination);
-    } catch (e) {
-      return false;
+  function isMuted() {
+    return !!(game && game.audio && game.audio.muted);
+  }
+
+  function ensureAudioContext() {
+    if (state.audioContext) return state.audioContext;
+    if (game && game.audioContext) {
+      state.audioContext = game.audioContext;
+    } else if (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      try {
+        state.audioContext = new Ctor();
+      } catch (e) {
+        state.audioContext = null;
+      }
     }
-    return true;
+    if (state.audioContext && !state.masterGain) {
+      try {
+        state.masterGain = state.audioContext.createGain();
+        state.masterGain.gain.value = isMuted() ? 0 : 0.16;
+        state.masterGain.connect(state.audioContext.destination);
+      } catch (e) {
+        state.masterGain = null;
+      }
+    }
+    return state.audioContext;
   }
 
-  function playNote(freq, when, duration, wave, gainValue) {
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = wave;
-    osc.frequency.value = freq;
-    gain.gain.setValueAtTime(gainValue, when);
-    gain.gain.exponentialRampToValueAtTime(0.001, when + duration);
-    osc.connect(gain);
-    gain.connect(masterGain);
-    osc.start(when);
-    osc.stop(when + duration + 0.02);
+  function noteFrequency(midiOffset) {
+    return midiToFrequency(currentStation().rootMidi + midiOffset);
   }
 
-  function scheduleStep() {
-    if (!audioCtx) return;
-    const st = station();
-    const pat = PATTERNS[st.id];
-    const stepDur = 60 / st.bpm / 2; // eighth notes
-    const now = audioCtx.currentTime;
-    const bassNote = pat.bass[radio.step % 16];
-    const leadNote = pat.lead[radio.step % 16];
-    if (bassNote) playNote(NOTE[bassNote], now, stepDur * 0.95, 'sine', pat.bassGain);
-    if (leadNote) playNote(NOTE[leadNote], now, stepDur * 0.9, pat.wave, pat.leadGain);
-    // Equalizer level pulses on bass steps.
-    radio.eqLevel = bassNote ? 0.9 : 0.35;
-    radio.step = (radio.step + 1) % 16;
-    timerId = setTimeout(scheduleStep, stepDur * 1000);
+  function playTone(freq, at, duration, wave, volume) {
+    const ac = state.audioContext;
+    if (!ac || !state.masterGain) return;
+    try {
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = wave || 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, at);
+      gain.gain.linearRampToValueAtTime(volume || 0.2, at + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, at + duration);
+      osc.connect(gain);
+      gain.connect(state.masterGain);
+      osc.start(at);
+      osc.stop(at + duration + 0.05);
+    } catch (e) { /* a failed note never breaks the game */ }
+  }
+
+  // One sequencer step: bass note, chord stab on the bar, lead note, hat.
+  function scheduleStep(step, at) {
+    const station = currentStation();
+    const beat = 60 / station.bpm;
+    const stepDur = beat / 2;
+    const swingShift = step % 2 === 1 ? station.swing * stepDur : 0;
+    const t = at + swingShift;
+    const bass = station.bassNotes[step % station.bassNotes.length];
+    playTone(noteFrequency(bass), t, stepDur * 0.9, station.bassWave, 0.32);
+    if (step % 4 === 0) {
+      for (const chord of station.chordNotes) {
+        playTone(noteFrequency(chord), t, stepDur * 1.8, station.chordWave, 0.07);
+      }
+    }
+    const lead = station.leadNotes[step % station.leadNotes.length];
+    playTone(noteFrequency(lead), t, stepDur * 0.8, station.leadWave, 0.1);
+    if (step % 2 === 0) {
+      playTone(5200, t, 0.03, 'square', 0.03);
+    }
+  }
+
+  function schedulerTick() {
+    const ac = state.audioContext;
+    if (!ac || !state.playing) return;
+    const station = currentStation();
+    const stepDur = 60 / station.bpm / 2;
+    while (state.nextNoteTime < ac.currentTime + 0.15) {
+      scheduleStep(state.step, state.nextNoteTime);
+      state.step += 1;
+      state.nextNoteTime += stepDur;
+    }
+  }
+
+  function startScheduler() {
+    if (typeof setInterval === 'undefined') return;
+    if (state.timerId !== null) return;
+    state.timerId = setInterval(schedulerTick, 40);
+  }
+
+  function stopScheduler() {
+    if (state.timerId !== null && typeof clearInterval !== 'undefined') {
+      clearInterval(state.timerId);
+    }
+    state.timerId = null;
   }
 
   function start() {
-    if (radio.playing) return;
-    if (!ensureAudio()) return;
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    radio.playing = true;
-    radio.step = 0;
-    scheduleStep();
+    state.started = true;
+    state.playing = true;
+    const ac = ensureAudioContext();
+    if (ac) {
+      if (ac.state === 'suspended' && typeof ac.resume === 'function') {
+        ac.resume().catch(() => {});
+      }
+      if (!state.nextNoteTime || state.nextNoteTime < ac.currentTime) {
+        state.nextNoteTime = ac.currentTime + 0.05;
+      }
+      startScheduler();
+    }
+    if (game) game.radioStation = stationName();
+    return stationName();
   }
 
   function stop() {
-    radio.playing = false;
-    if (timerId !== null) {
-      clearTimeout(timerId);
-      timerId = null;
-    }
-  }
-
-  // R: cycle to the next station. Keeps playing; the loop pattern
-  // switches on the next scheduled step.
-  function cycle() {
-    radio.stationIndex = (radio.stationIndex + 1) % STATIONS.length;
-    radio.step = 0;
+    state.playing = false;
+    stopScheduler();
     return stationName();
   }
 
   function setStation(index) {
-    radio.stationIndex = ((index % STATIONS.length) + STATIONS.length) % STATIONS.length;
-    radio.step = 0;
+    const n = RADIO_STATIONS.length;
+    const next = ((Math.floor(index) % n) + n) % n;
+    if (next !== state.index) {
+      state.index = next;
+      state.step = 0;
+      state.stationHistory.push(stationName());
+      if (game) game.radioStation = stationName();
+    }
     return stationName();
   }
 
-  // HUD: station name + a small animated equalizer (5 bars).
-  function drawHud(ctx, x, y) {
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 16px sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText(`♪ ${stationName()}`, x, y);
-    const bars = 5;
-    for (let i = 0; i < bars; i++) {
-      const h = 4 + radio.eqLevel * 10 * (0.5 + 0.5 * Math.sin(Date.now() / 90 + i * 1.3));
-      ctx.fillStyle = '#fca311';
-      ctx.fillRect(x + i * 8, y + 8 - h, 5, h);
-    }
-    // Equalizer decays between bass steps so the bars animate.
-    radio.eqLevel = Math.max(0.15, radio.eqLevel * 0.94);
+  function cycle() {
+    const name = setStation(state.index + 1);
+    state.cycles += 1;
+    if (state.started && !state.playing) start();
+    return name;
   }
 
-  function serialize() {
-    return { stationIndex: radio.stationIndex };
+  // Scripted check helper: cycles through all three stations from the
+  // current one and returns the station name seen after each press.
+  function cycleAllStations() {
+    const seen = [];
+    for (let i = 0; i < RADIO_STATIONS.length; i++) {
+      seen.push(cycle());
+    }
+    return seen;
   }
 
-  function deserialize(data) {
-    if (data && typeof data.stationIndex === 'number') {
-      setStation(data.stationIndex);
+  function onKey(code) {
+    if (code === 'KeyR') {
+      cycle();
+      return true;
     }
+    return false;
+  }
+
+  function update() {
+    if (state.masterGain && state.audioContext) {
+      try {
+        state.masterGain.gain.value = isMuted() ? 0 : 0.16;
+      } catch (e) { /* ignore */ }
+    }
+    if (game) game.radioStation = stationName();
+    return state;
+  }
+
+  // Beat phase in [0, 1): drives the equalizer even with no audio.
+  function beatPhase() {
+    const station = currentStation();
+    let t = 0;
+    if (game && game.time && typeof game.time.now === 'number') t = game.time.now;
+    else t = Date.now() / 1000;
+    const beat = 60 / station.bpm;
+    return (t % beat) / beat;
+  }
+
+  function equalizerLevels() {
+    const phase = beatPhase();
+    const levels = [];
+    for (let i = 0; i < EQUALIZER_BARS; i++) {
+      const wave = Math.abs(Math.sin((phase + i * 0.37) * Math.PI * 2));
+      levels.push(Math.round(wave * 100) / 100);
+    }
+    return levels;
+  }
+
+  function drawEqualizer(ctx, x, y, width, height) {
+    if (!ctx) return;
+    const levels = equalizerLevels();
+    const barW = width / EQUALIZER_BARS;
+    for (let i = 0; i < EQUALIZER_BARS; i++) {
+      const barH = Math.max(2, levels[i] * height);
+      ctx.fillStyle = i % 2 === 0 ? '#1abc9c' : '#f1c40f';
+      ctx.fillRect(x + i * barW + 1, y + height - barH, barW - 2, barH);
+    }
+  }
+
+  function hudText() {
+    return { station: stationName(), tagline: currentStation().tagline };
+  }
+
+  function snapshot() {
+    return {
+      station: stationName(),
+      index: state.index,
+      playing: state.playing,
+      cycles: state.cycles,
+      history: [...state.stationHistory],
+    };
   }
 
   return {
-    radio,
-    station,
-    stationName,
+    state,
+    stations: RADIO_STATIONS,
     start,
     stop,
     cycle,
     setStation,
-    drawHud,
-    serialize,
-    deserialize,
+    cycleAllStations,
+    currentStation,
+    stationName,
+    onKey,
+    update,
+    beatPhase,
+    equalizerLevels,
+    drawEqualizer,
+    hudText,
+    snapshot,
   };
 }
+
+export default createRadio;
