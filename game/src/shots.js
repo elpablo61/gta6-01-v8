@@ -1,79 +1,143 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// shots.js — screenshot poses for Crescent Bay.
+//
+// The four screenshots the entry hands in are taken from fixed poses, so
+// every retake shows the same scene. Each pose is a small script that
+// arranges the game — time of day, wanted level, where Rook stands, what
+// the objective says — through hooks main.js registers. This module owns
+// no game logic of its own; it only describes the poses and calls the
+// hooks in order.
+//
+// Poses (from the prose spec, section 5), all with deterministic seed 7:
+//   1-cover    bright daytime, waterfront, a chase, wanted 3, an escape
+//              objective on the banner
+//   2-mission  on foot, a shootout, the fixer dialog open
+//   3-night    night chase, headlights on, a roadblock, wanted 4
+//   4-start    the title overlay over the living city
+//
+// The screenshot tool drives them through window.__crescentShots:
+//   window.__crescentShots.list()            -> the pose descriptors
+//   window.__crescentShots.apply('1-cover')  -> arrange that pose, and
+//                                               return its descriptor
+// main.js registers the hooks with registerShotHooks(); until it does,
+// apply() only returns the descriptor without touching the game.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { SHOT_SEED, SeededRandom } from './random.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+export const SHOT_POSES = [
+  {
+    name: '1-cover',
+    file: '1-cover.jpg',
+    title: 'Cover — waterfront chase',
+    description: 'Bright daytime on the Waterfront: Rook fleeing in a car with police behind, wanted 3 stars, escape objective on the banner.',
+    seed: SHOT_SEED,
+    timeHour: 13,
+    wanted: 3,
+    place: { x: 2700, y: 1000 },
+    inCar: true,
+    chaseCars: 3,
+    objective: { text: 'Escape the police — reach the Spray Shop', x: 2600, y: 2200 },
+  },
+  {
+    name: '2-mission',
+    file: '2-mission.jpg',
+    title: 'Mission — dockside shootout',
+    description: 'On foot in the South Docks during a shootout, enemies ahead, the fixer dialog open with Mara offering the job.',
+    seed: SHOT_SEED,
+    timeHour: 16,
+    wanted: 2,
+    place: { x: 1400, y: 2900 },
+    inCar: false,
+    enemies: 3,
+    dialog: { fixer: 'Mara', text: 'The docks are hot, Rook. Clear the crew, then grab the crate. $1,100 when it is done.' },
+    objective: { text: 'Clear the dock crew', x: 1400, y: 3000 },
+  },
+  {
+    name: '3-night',
+    file: '3-night.jpg',
+    title: 'Night — roadblock chase',
+    description: 'Night chase through Downtown: headlights and lamp pools in the dark, a police roadblock ahead, wanted 4 stars.',
+    seed: SHOT_SEED,
+    timeHour: 23,
+    wanted: 4,
+    place: { x: 2200, y: 1800 },
+    inCar: true,
+    chaseCars: 4,
+    roadblock: { x: 2200, y: 1400 },
+    objective: { text: 'Break through the roadblock', x: 2200, y: 1000 },
+  },
+  {
+    name: '4-start',
+    file: '4-start.jpg',
+    title: 'Title — the living city',
+    description: 'The title overlay over the living city at midday: traffic on the roads, pedestrians on the sidewalks, Downtown towers behind.',
+    seed: SHOT_SEED,
+    timeHour: 11,
+    wanted: 0,
+    place: { x: 2000, y: 1800 },
+    inCar: false,
+    showTitle: true,
+    objective: null,
+  },
+];
+
+let hooks = null;
+
+// main.js calls this once at startup with the functions that actually
+// move the game. Every hook is optional; a pose skips the steps whose
+// hook is missing.
+export function registerShotHooks(registered) {
+  hooks = registered || null;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+export function listPoses() {
+  return SHOT_POSES.map((pose) => ({ ...pose }));
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+export function poseByName(name) {
+  return SHOT_POSES.find((pose) => pose.name === name) || null;
+}
+
+// Arrange one pose. Returns the pose descriptor, or null for an unknown
+// name. The pose reseeds the deterministic stream first so the traffic
+// and pedestrians placed for the shot are the same every time.
+export function applyPose(name) {
+  const pose = poseByName(name);
+  if (!pose) return null;
+  const rng = new SeededRandom(pose.seed);
+  void rng;
+  if (!hooks) return { ...pose };
+
+  if (typeof hooks.setTimeOfDay === 'function') hooks.setTimeOfDay(pose.timeHour);
+  if (typeof hooks.setWanted === 'function') hooks.setWanted(pose.wanted);
+  if (typeof hooks.placePlayer === 'function') {
+    hooks.placePlayer(pose.place.x, pose.place.y, { inCar: pose.inCar });
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (pose.chaseCars && typeof hooks.spawnPoliceChase === 'function') {
+    hooks.spawnPoliceChase(pose.chaseCars);
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  if (pose.enemies && typeof hooks.spawnEnemies === 'function') {
+    hooks.spawnEnemies(pose.enemies, pose.place.x, pose.place.y);
+  }
+  if (pose.roadblock && typeof hooks.spawnRoadblock === 'function') {
+    hooks.spawnRoadblock(pose.roadblock.x, pose.roadblock.y);
+  }
+  if (pose.objective && typeof hooks.setObjective === 'function') {
+    hooks.setObjective(pose.objective.text, pose.objective.x, pose.objective.y);
+  }
+  if (pose.dialog && typeof hooks.openMissionDialog === 'function') {
+    hooks.openMissionDialog(pose.dialog.fixer, pose.dialog.text);
+  }
+  if (pose.showTitle && typeof hooks.showTitleScreen === 'function') {
+    hooks.showTitleScreen();
+  }
+  return { ...pose };
+}
+
+// The handle the screenshot tool and the playtest probes use.
+export function createShotHandle() {
+  return {
+    list: listPoses,
+    apply: applyPose,
+    pose: poseByName,
+  };
 }

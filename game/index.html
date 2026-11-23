@@ -1,19 +1,111 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Block Dodger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Crescent Bay — an open-world crime game</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #11141b; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  /* Read aloud, never shown: the status line screen readers announce. */
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0e1a; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #f2f2f2; }
+  #game-canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+
+  .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(5, 8, 20, 0.72); z-index: 10; }
+  .overlay.hidden { display: none; }
+  .panel { background: rgba(16, 20, 38, 0.96); border: 2px solid #2e4a6b; border-radius: 12px; padding: 28px 32px; max-width: 560px; width: min(92vw, 560px); box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6); }
+  .panel h1 { font-size: 44px; letter-spacing: 2px; color: #ffd640; text-transform: uppercase; }
+  .panel h2 { font-size: 26px; color: #ffd640; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .panel p { margin: 10px 0; line-height: 1.5; color: #d8dce8; }
+  .subtitle { color: #7fe3c0; font-weight: 600; margin-bottom: 18px; }
+  .panel button { display: block; width: 100%; margin: 8px 0; padding: 12px 16px; font-size: 17px; font-weight: 700; color: #0b0e1a; background: #ffd640; border: none; border-radius: 8px; cursor: pointer; }
+  .panel button:hover { background: #ffe14d; }
+  .panel button.secondary { background: #2e4a6b; color: #f2f2f2; }
+  .panel button.secondary:hover { background: #3a5a80; }
+
+  #save-slots { margin: 14px 0; }
+  .save-slot { display: block; width: 100%; margin: 6px 0; padding: 10px 12px; font-size: 15px; text-align: left; color: #f2f2f2; background: #232a44; border: 1px solid #3a4a6b; border-radius: 6px; cursor: pointer; }
+  .save-slot:hover { background: #2c3554; }
+
+  #controls-list { margin: 14px 0 4px; padding: 12px 14px; background: rgba(255, 255, 255, 0.05); border-radius: 8px; font-size: 14px; line-height: 1.9; list-style: none; }
+  #controls-list li b { color: #ffd640; }
+
+  #radio-station { position: fixed; top: 12px; right: 220px; z-index: 5; font-size: 15px; font-weight: 700; color: #7fe3c0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8); pointer-events: none; }
+
+  #mission-dialog .panel { border-color: #ffd640; }
+  #dialog-fixer { color: #7fe3c0; font-size: 20px; font-weight: 800; }
+  #dialog-text { font-size: 17px; }
+
+  .garage-row { margin: 10px 0; }
+  .garage-row button { width: auto; display: inline-block; margin: 4px 6px 4px 0; padding: 8px 12px; font-size: 15px; }
+  .paint-swatch { width: 34px; height: 34px; border-radius: 50%; border: 2px solid #fff; padding: 0; }
+  #garage-cash { font-weight: 800; color: #ffd640; }
+
+  #game-over-title { font-size: 52px; color: #ff4d4d; letter-spacing: 4px; }
+  .hint { font-size: 13px; color: #9aa3b8; margin-top: 12px; }
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Block Dodger: move the paddle left and right to dodge falling blocks and catch coins"></canvas>
-<p id="status" role="status" aria-live="polite"></p>
+<canvas id="game-canvas"></canvas>
+<div id="radio-station">♪ Bay FM</div>
+
+<!-- Title screen: New Game + 3 save slots + controls -->
+<div id="title-screen" class="overlay">
+  <div class="panel">
+    <h1>Crescent Bay</h1>
+    <p class="subtitle">An open-world crime game — play as Rook, run jobs for Mara and Dex, and stay ahead of the Crescent Bay police.</p>
+    <button id="new-game-btn">New Game</button>
+    <div id="save-slots"></div>
+    <ul id="controls-list">
+      <li><b>WASD / Arrows</b> — move on foot, drive</li>
+      <li><b>Mouse</b> — aim &nbsp;·&nbsp; <b>Click</b> — shoot</li>
+      <li><b>Shift</b> — sprint &nbsp;·&nbsp; <b>E</b> — enter car / accept / garage</li>
+      <li><b>1 / 2 / 3</b> — pistol / SMG / shotgun &nbsp;·&nbsp; <b>Q</b> — cycle weapon</li>
+      <li><b>R</b> — radio station &nbsp;·&nbsp; <b>P</b> — pause &nbsp;·&nbsp; <b>M</b> — mute</li>
+    </ul>
+    <p class="hint">Free roam, 12 story missions, wanted stars, a police helicopter, a garage that sells upgrades, three radio stations and three save slots. No network, no downloads — everything runs from these files.</p>
+  </div>
+</div>
+
+<!-- Pause menu -->
+<div id="pause-menu" class="overlay hidden">
+  <div class="panel">
+    <h2>Paused</h2>
+    <p>Rook waits. The city does not.</p>
+    <button id="resume-btn">Resume</button>
+    <button id="save-btn" class="secondary">Save to active slot</button>
+    <button id="quit-btn" class="secondary">Quit to title</button>
+  </div>
+</div>
+
+<!-- Game over -->
+<div id="game-over-screen" class="overlay hidden">
+  <div class="panel">
+    <h2 id="game-over-title">DOWN</h2>
+    <p id="game-over-text">Rook is down.</p>
+    <button id="retry-btn">Retry the mission</button>
+    <button id="quit-btn-2" class="secondary">Quit to title</button>
+  </div>
+</div>
+
+<!-- Mission dialog -->
+<div id="mission-dialog" class="overlay hidden">
+  <div class="panel">
+    <h2 id="dialog-fixer">Mara</h2>
+    <p id="dialog-text"></p>
+    <button id="dialog-accept">Accept (E)</button>
+    <button id="dialog-decline" class="secondary">Not now</button>
+  </div>
+</div>
+
+<!-- Fixer Garage upgrade menu -->
+<div id="garage-menu" class="overlay hidden">
+  <div class="panel">
+    <h2>Fixer Garage</h2>
+    <p id="garage-cash">Cash: $0</p>
+    <div id="garage-upgrades"></div>
+    <button id="garage-close" class="secondary">Close</button>
+  </div>
+</div>
+
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>
