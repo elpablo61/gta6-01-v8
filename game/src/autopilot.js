@@ -224,13 +224,18 @@ export function createAutopilot(game) {
     const len = Math.hypot(dx, dy) || 1;
     input.moveX = dx / len;
     input.moveY = dy / len;
-    input.sprint = !!sprint;
+    // Sprint is a read-only getter over the held-key set (main.js
+    // defines it with no setter), so assigning it throws and kills
+    // the whole autopilot update — Rook froze mid-mission in the m1
+    // probe the moment a move was set. Sprint only through the key
+    // set: holding ShiftLeft is what the getter reads.
     if (input.keys && typeof input.keys.add === 'function') {
       if (dx < -0.3) input.keys.add('KeyA');
       if (dx > 0.3) input.keys.add('KeyD');
       if (dy < -0.3) input.keys.add('KeyW');
       if (dy > 0.3) input.keys.add('KeyS');
       if (sprint) input.keys.add('ShiftLeft');
+      else input.keys.delete('ShiftLeft');
     }
   }
 
@@ -239,7 +244,8 @@ export function createAutopilot(game) {
     if (!input) return;
     input.moveX = 0;
     input.moveY = 0;
-    input.sprint = false;
+    // Never assign input.sprint: it is a getter-only property (see
+    // setMove). Clearing the Shift keys releases the sprint instead.
     input.mouseDown = false;
     if (input.keys && typeof input.keys.delete === 'function') {
       for (const k of ['KeyA', 'KeyD', 'KeyW', 'KeyS', 'ShiftLeft', 'ShiftRight']) input.keys.delete(k);
@@ -591,6 +597,19 @@ export function createAutopilot(game) {
     if (!p) return;
     const roadPt = nearestRoadPoint(to.x, to.y);
     const route = buildRoute(p.x, p.y, roadPt.x, roadPt.y);
+    // Drop every leading waypoint Rook has already passed. On a
+    // shortest grid path each waypoint is closer to the destination
+    // than the one before it, so a leading waypoint farther from the
+    // destination than Rook is right now sits BEHIND Rook — walking
+    // back to it is what pinned Rook in a jitter box at the market
+    // junction in the m1 probe (route rebuilt, first waypoint the
+    // junction behind him, walk back, pop it, walk on, rebuild again,
+    // forever). Cars keep the first junction (their fix); walkers
+    // must never be sent backwards.
+    const destD = Math.hypot(to.x - p.x, to.y - p.y);
+    while (route.length > 0 && Math.hypot(route[0].x - to.x, route[0].y - to.y) > destD) {
+      route.shift();
+    }
     // Final leg on foot from the road to the exact point.
     route.push({ x: to.x, y: to.y });
     state.walkRoute = route;
@@ -963,9 +982,20 @@ export function createAutopilot(game) {
       state.carSwapTarget = null;
       return;
     }
-    if (choice && choice.dist < 260) {
+    // Only a PARKED car (or the car this driver already chose to swap
+    // to) is a walk target. A moving traffic car is never chased on
+    // foot: its position moves, the walk memo trips every second, the
+    // route rebuilds, and Rook gets yanked back to the junction
+    // behind him instead of ever reaching a car — the m1 stall. With
+    // no parked car near, walk to the destination; a parked car on
+    // the way will be picked up then.
+    const walkCar =
+      choice && choice.dist < 260 && (choice.car.parked || choice.car === state.carSwapTarget)
+        ? choice
+        : null;
+    if (walkCar) {
       // A car is close: walk straight to it instead of the destination.
-      const arrived = walkToward({ x: choice.car.x, y: choice.car.y, kind: 'car' }, dt);
+      const arrived = walkToward({ x: walkCar.car.x, y: walkCar.car.y, kind: 'car' }, dt);
       if (!arrived) return;
     }
     walkToward(dest, dt);
