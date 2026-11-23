@@ -1,281 +1,320 @@
-// pedestrians.js — Crescent Bay pedestrians (fresh from prose spec §1, §3.6).
+// Pedestrians — people on the sidewalks (Crescent Bay).
 //
-// People walk the sidewalks (offset from the road centreline), cross at
-// junctions now and then, and flee when scared — a gunshot, a speeding
-// car, or police trouble nearby. Variety: different colours and walking
-// speeds, some walking in pairs (spec §3.6).
+// Fresh from prose spec §1 + §3.6. Pedestrians walk the sidewalks and
+// flee when scared: a gunshot nearby, a speeding car bearing down, or
+// Rook pointing a gun at them. They come in many colours and walking
+// speeds, and about a quarter of them walk in pairs, side by side.
+// Walking follows the road graph: a pedestrian picks a road, walks
+// along it on the sidewalk (offset from the centreline), and turns at
+// a junction instead of cutting across a block. Nobody walks through
+// a building or into the water.
 //
-// Context object G (only what this module reads):
-//   G.rng     — function () => [0,1); local mulberry32 fallback
-//   G.player  — { x, y } for despawn distance
-//   G.scares  — optional array the game may push { x, y, radius } into;
-//               scare(x, y, radius) is the direct call
-//
-// Public API (returned by createPedestrians):
-//   update(dt)
-//   draw(ctx, cam)
-//   list()                 live pedestrians
-//   scare(x, y, radius)    make nearby pedestrians flee
-//   spawnFleeing(x, y, color)  a carjacked driver running away
-//   count()
-//   clear()
+// Shared-state contract (everything read defensively):
+//   game.player { x, y, speed, onFoot } — Rook; fast cars scare peds.
+//   game.cars   — array of car objects; a speeding car nearby scares peds.
+//   game.peds / game.pedestrians — the shared pedestrian list (kept in
+//                sync with this module's list so the renderer draws them).
+//   game.world  { isBlocked(x, y), tryMove(x, y, dx, dy) } — collision.
+//   game.lastGunshot { x, y, at } — written by combat on every shot.
+//   game.state  — only walk while 'playing' (or when unset, for tests).
+// Pedestrian shape (shared with player.js carjacking + render.js):
+//   { x, y, angle, speed, walkSpeed, color, paired, pairedWith,
+//     state: 'walk' | 'flee', fleeing, fleeT, fleeFromX, fleeFromY }
 
-export const WORLD = 3200;
-export const ROAD_STEP = 400;
-export const ROAD_FIRST = 200;
-export const ROAD_COUNT = 8;
-export const SIDEWALK = 48; // sidewalk offset from road centreline
-
-const SHIRTS = [
-  '#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c',
-  '#e67e22', '#ecf0f1', '#fd79a8', '#00cec9', '#fdcb6e', '#6c5ce7',
+export const PEDESTRIAN_PALETTE = [
+  '#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6',
+  '#1abc9c', '#e67e22', '#ecf0f1', '#34495e', '#fd79a8',
+  '#00cec9', '#fdcb6e', '#6c5ce7', '#d63031', '#55efc4',
 ];
-const PANTS = ['#2c3e50', '#34495e', '#7f8c8d', '#5d4037', '#1a252f'];
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+export const PEDESTRIAN_WALK_SPEEDS = [42, 55, 68, 80, 95];
+export const PEDESTRIAN_FLEE_SPEED = 210;
+export const PEDESTRIAN_TARGET_COUNT = 28;
+export const PEDESTRIAN_PAIR_CHANCE = 0.25;
+export const PEDESTRIAN_PAIR_OFFSET = 26;
+export const PEDESTRIAN_SCARE_RADIUS = 260;
+export const PEDESTRIAN_CAR_SCARE_RADIUS = 120;
+export const PEDESTRIAN_CAR_SCARE_SPEED = 200;
+export const PEDESTRIAN_SIDEWALK_OFFSET = 46;
+export const PEDESTRIAN_SPAWN_MIN = 480;
+export const PEDESTRIAN_SPAWN_MAX = 950;
+export const PEDESTRIAN_DESPAWN_DISTANCE = 1150;
+
+const ROAD_LINES = [200, 600, 1000, 1400, 1800, 2200, 2600, 3000];
+
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function blockedAt(game, x, y) {
+  if (x < 20 || x > 3180 || y < 20 || y > 3180) return true;
+  if (game && game.world && typeof game.world.isBlocked === 'function') {
+    return game.world.isBlocked(x, y, 8);
+  }
+  // Fallback from spec geometry: off the road + sidewalk is a block.
+  let nearest = Infinity;
+  for (const c of ROAD_LINES) nearest = Math.min(nearest, Math.abs(x - c), Math.abs(y - c));
+  return nearest > 46;
+}
+
+// A walkable sidewalk point: on a road centreline, offset to the side.
+function sidewalkPoint() {
+  const line = pick(ROAD_LINES);
+  const along = 120 + Math.random() * 2960;
+  const side = Math.random() < 0.5 ? -1 : 1;
+  if (Math.random() < 0.5) return { x: line + side * PEDESTRIAN_SIDEWALK_OFFSET, y: along };
+  return { x: along, y: line + side * PEDESTRIAN_SIDEWALK_OFFSET };
+}
+
+export function createPedestrian(x, y, opts) {
+  const o = opts || {};
+  const paired = o.paired !== undefined ? o.paired : Math.random() < PEDESTRIAN_PAIR_CHANCE;
+  return {
+    x, y,
+    angle: o.angle !== undefined ? o.angle : Math.random() * Math.PI * 2,
+    speed: 0,
+    walkSpeed: o.walkSpeed || pick(PEDESTRIAN_WALK_SPEEDS),
+    color: o.color || pick(PEDESTRIAN_PALETTE),
+    paired,
+    pairOffset: paired ? PEDESTRIAN_PAIR_OFFSET : 0,
+    pairedWith: null,
+    state: 'walk',
+    fleeing: false,
+    fleeT: 0,
+    fleeFromX: 0,
+    fleeFromY: 0,
+    dirX: o.dirX !== undefined ? o.dirX : (Math.random() < 0.5 ? -1 : 1),
+    dirY: o.dirY !== undefined ? o.dirY : 0,
+    turnT: 2 + Math.random() * 6,
   };
 }
 
-function roadCoord(i) { return ROAD_FIRST + i * ROAD_STEP; }
-function nearestRoadIndex(v) {
-  return Math.max(0, Math.min(ROAD_COUNT - 1, Math.round((v - ROAD_FIRST) / ROAD_STEP)));
-}
+export function createPedestrians(game) {
+  const state = {
+    list: [],
+    spawned: 0,
+    fled: 0,
+    pairsFormed: 0,
+  };
 
-export function createPedestrians(G) {
-  const game = G || {};
-  const rng = typeof game.rng === 'function' ? game.rng : mulberry32(20261119);
-  let people = [];
-  let nextId = 1;
-
-  function makePerson(x, y, opts) {
-    const o = opts || {};
-    const p = {
-      id: nextId++,
-      x, y,
-      // Walking axis: 'h' along a horizontal road, 'v' along a vertical one.
-      axis: o.axis || (rng() < 0.5 ? 'h' : 'v'),
-      dir: o.dir || (rng() < 0.5 ? 1 : -1),
-      speed: o.speed || (26 + rng() * 30),
-      baseSpeed: 0,
-      shirt: o.shirt || SHIRTS[Math.floor(rng() * SHIRTS.length)],
-      pants: PANTS[Math.floor(rng() * PANTS.length)],
-      state: 'walk', // walk | flee | cross
-      fleeX: 0, fleeY: 0,
-      fleeTime: 0,
-      pairId: o.pairId || 0,
-      pause: 0,
-      roadIndex: 0,
-      side: rng() < 0.5 ? -1 : 1,
-    };
-    p.baseSpeed = p.speed;
-    // Snap onto the sidewalk of the nearest road on the walking axis.
-    if (p.axis === 'h') {
-      p.roadIndex = nearestRoadIndex(y);
-      p.y = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-    } else {
-      p.roadIndex = nearestRoadIndex(x);
-      p.x = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-    }
-    return p;
+  function playerPos() {
+    const p = game && game.player;
+    if (p && typeof p.x === 'number') return p;
+    return { x: 1600, y: 1600, speed: 0 };
   }
 
-  function spawnPerson(nearX, nearY) {
-    const j = {
-      col: Math.floor(rng() * ROAD_COUNT),
-      row: Math.floor(rng() * ROAD_COUNT),
-    };
-    let x = roadCoord(j.col) + (rng() - 0.5) * 300;
-    let y = roadCoord(j.row) + (rng() - 0.5) * 300;
-    if (typeof nearX === 'number') {
-      x = nearX + (rng() - 0.5) * 500;
-      y = nearY + (rng() - 0.5) * 500;
-    }
-    x = Math.max(30, Math.min(WORLD - 30, x));
-    y = Math.max(30, Math.min(WORLD - 30, y));
-    const p = makePerson(x, y);
-    // A pair partner walks beside them, same speed and direction.
-    if (rng() < 0.3) {
-      const partner = makePerson(x + 14 * p.dir, y + 10, {
-        axis: p.axis, dir: p.dir, speed: p.speed, pairId: p.id,
-        shirt: SHIRTS[Math.floor(rng() * SHIRTS.length)],
-      });
-      partner.roadIndex = p.roadIndex;
-      partner.side = p.side;
-      p.pairId = partner.id;
-      people.push(partner);
-    }
-    people.push(p);
-    return p;
+  function syncList() {
+    if (!game) return;
+    game.peds = state.list;
+    game.pedestrians = state.list;
   }
 
-  function updatePerson(p, dt) {
-    if (p.pause > 0) { p.pause -= dt; return; }
+  function spawnPedestrian(x, y, opts) {
+    const ped = createPedestrian(x, y, opts);
+    state.list.push(ped);
+    state.spawned += 1;
+    syncList();
+    return ped;
+  }
 
-    if (p.state === 'flee') {
-      p.fleeTime -= dt;
-      const dx = p.x - p.fleeX;
-      const dy = p.y - p.fleeY;
-      const d = Math.hypot(dx, dy) || 1;
-      const runSpeed = p.baseSpeed * 3.2;
-      p.x += (dx / d) * runSpeed * dt;
-      p.y += (dy / d) * runSpeed * dt;
-      p.x = Math.max(20, Math.min(WORLD - 20, p.x));
-      p.y = Math.max(20, Math.min(WORLD - 20, p.y));
-      if (p.fleeTime <= 0) {
-        p.state = 'walk';
-        p.speed = p.baseSpeed;
-        // Settle back onto the nearest sidewalk.
-        if (Math.abs(p.x - roadCoord(nearestRoadIndex(p.x))) <
-            Math.abs(p.y - roadCoord(nearestRoadIndex(p.y)))) {
-          p.axis = 'v';
-          p.roadIndex = nearestRoadIndex(p.x);
-          p.x = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-        } else {
-          p.axis = 'h';
-          p.roadIndex = nearestRoadIndex(p.y);
-          p.y = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-        }
+  // Spawn one pedestrian on a sidewalk near the player, at a random
+  // road, walking along it. Paired peds spawn with a partner beside them.
+  function spawnNearPlayer() {
+    const p = playerPos();
+    for (let tries = 0; tries < 10; tries++) {
+      const pt = sidewalkPoint();
+      const d = Math.hypot(pt.x - p.x, pt.y - p.y);
+      if (d < PEDESTRIAN_SPAWN_MIN || d > PEDESTRIAN_SPAWN_MAX) continue;
+      if (blockedAt(game, pt.x, pt.y)) continue;
+      const ped = spawnPedestrian(pt.x, pt.y);
+      // Pair up: a partner walks beside this one, same direction.
+      if (ped.paired) {
+        const partner = spawnPedestrian(
+          pt.x + (ped.dirY === 0 ? 0 : PEDESTRIAN_PAIR_OFFSET),
+          pt.y + (ped.dirY === 0 ? PEDESTRIAN_PAIR_OFFSET : 0),
+          { color: pick(PEDESTRIAN_PALETTE), walkSpeed: ped.walkSpeed, paired: true, dirX: ped.dirX, dirY: ped.dirY },
+        );
+        ped.pairedWith = partner;
+        partner.pairedWith = ped;
+        state.pairsFormed += 1;
       }
+      return ped;
+    }
+    return null;
+  }
+
+  // Every pedestrian within radius of (x, y) runs away from it.
+  function scarePedestrians(x, y, radius) {
+    const r = radius || PEDESTRIAN_SCARE_RADIUS;
+    let n = 0;
+    for (const ped of state.list) {
+      if (!ped || ped.dead) continue;
+      if (Math.hypot(ped.x - x, ped.y - y) < r) {
+        ped.state = 'flee';
+        ped.fleeing = true;
+        ped.fleeT = 4;
+        ped.fleeFromX = x;
+        ped.fleeFromY = y;
+        n += 1;
+      }
+    }
+    state.fled += n;
+    return n;
+  }
+
+  function stepWalk(ped, dt) {
+    // Walk along the current direction; at a junction, sometimes turn.
+    ped.turnT -= dt;
+    if (ped.turnT <= 0) {
+      ped.turnT = 3 + Math.random() * 7;
+      // Turn left or right at a junction (swap axes, keep moving).
+      if (Math.random() < 0.45) {
+        const nx = ped.dirY;
+        const ny = ped.dirX * (Math.random() < 0.5 ? 1 : -1);
+        ped.dirX = nx;
+        ped.dirY = ny;
+      }
+    }
+    const step = ped.walkSpeed * dt;
+    const dx = ped.dirX * step;
+    const dy = ped.dirY * step;
+    if (game && game.world && typeof game.world.tryMove === 'function') {
+      const moved = game.world.tryMove(ped.x, ped.y, dx, dy, 8);
+      ped.x = moved.x;
+      ped.y = moved.y;
+      if (moved.hitX) ped.dirX = -ped.dirX;
+      if (moved.hitY) ped.dirY = -ped.dirY;
+    } else {
+      const nx = ped.x + dx, ny = ped.y + dy;
+      if (!blockedAt(game, nx, ny)) { ped.x = nx; ped.y = ny; }
+      else { ped.dirX = -ped.dirX; ped.dirY = -ped.dirY; }
+    }
+    ped.speed = ped.walkSpeed;
+    ped.angle = Math.atan2(ped.dirY, ped.dirX);
+    // A paired partner keeps its side offset from its partner.
+    if (ped.pairedWith && !ped.pairedWith.dead) {
+      const partner = ped.pairedWith;
+      const wantX = partner.x + (partner.dirY === 0 ? 0 : PEDESTRIAN_PAIR_OFFSET);
+      const wantY = partner.y + (partner.dirY === 0 ? PEDESTRIAN_PAIR_OFFSET : 0);
+      ped.x += (wantX - ped.x) * Math.min(1, dt * 4);
+      ped.y += (wantY - ped.y) * Math.min(1, dt * 4);
+      ped.dirX = partner.dirX;
+      ped.dirY = partner.dirY;
+    }
+  }
+
+  function stepFlee(ped, dt) {
+    ped.fleeT -= dt;
+    if (ped.fleeT <= 0) {
+      ped.state = 'walk';
+      ped.fleeing = false;
+      ped.speed = ped.walkSpeed;
       return;
     }
+    const away = Math.atan2(ped.y - ped.fleeFromY, ped.x - ped.fleeFromX);
+    const step = PEDESTRIAN_FLEE_SPEED * dt;
+    const dx = Math.cos(away) * step;
+    const dy = Math.sin(away) * step;
+    if (game && game.world && typeof game.world.tryMove === 'function') {
+      const moved = game.world.tryMove(ped.x, ped.y, dx, dy, 8);
+      ped.x = moved.x;
+      ped.y = moved.y;
+    } else {
+      const nx = ped.x + dx, ny = ped.y + dy;
+      if (!blockedAt(game, nx, ny)) { ped.x = nx; ped.y = ny; }
+    }
+    ped.speed = PEDESTRIAN_FLEE_SPEED;
+    ped.angle = away;
+  }
 
-    // Walk along the sidewalk.
-    const step = p.speed * p.dir * dt;
-    if (p.axis === 'h') p.x += step;
-    else p.y += step;
-
-    // At a junction, sometimes cross to the other sidewalk or turn.
-    const jx = roadCoord(nearestRoadIndex(p.x));
-    const jy = roadCoord(nearestRoadIndex(p.y));
-    const atJunction = Math.abs(p.x - jx) < 12 && Math.abs(p.y - jy) < 12;
-    if (atJunction && rng() < dt * 0.5) {
-      const roll = rng();
-      if (roll < 0.25) {
-        // Cross the road: switch sidewalk side.
-        p.side = -p.side;
-        if (p.axis === 'h') p.y = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-        else p.x = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-      } else if (roll < 0.5) {
-        // Turn onto the crossing road.
-        p.axis = p.axis === 'h' ? 'v' : 'h';
-        p.dir = rng() < 0.5 ? 1 : -1;
-        if (p.axis === 'h') {
-          p.roadIndex = nearestRoadIndex(p.y);
-          p.y = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-        } else {
-          p.roadIndex = nearestRoadIndex(p.x);
-          p.x = roadCoord(p.roadIndex) + p.side * SIDEWALK;
-        }
-      } else if (roll < 0.6) {
-        p.dir = -p.dir; // turn around
-      } else {
-        p.pause = 0.5 + rng() * 2; // idle a moment
+  // What scares a pedestrian this frame: a fresh gunshot, a speeding
+  // car close by, or Rook sprinting straight at them on foot.
+  function checkScares(ped) {
+    if (ped.state === 'flee') return;
+    const gs = game && game.lastGunshot;
+    if (gs && Math.hypot(ped.x - gs.x, ped.y - gs.y) < PEDESTRIAN_SCARE_RADIUS) {
+      ped.state = 'flee';
+      ped.fleeing = true;
+      ped.fleeT = 4;
+      ped.fleeFromX = gs.x;
+      ped.fleeFromY = gs.y;
+      state.fled += 1;
+      return;
+    }
+    for (const car of game && game.cars ? game.cars : []) {
+      if (!car || car.wrecked) continue;
+      const d = Math.hypot(ped.x - car.x, ped.y - car.y);
+      if (d < PEDESTRIAN_CAR_SCARE_RADIUS && Math.abs(car.speed || 0) > PEDESTRIAN_CAR_SCARE_SPEED) {
+        ped.state = 'flee';
+        ped.fleeing = true;
+        ped.fleeT = 3;
+        ped.fleeFromX = car.x;
+        ped.fleeFromY = car.y;
+        state.fled += 1;
+        return;
       }
     }
+  }
 
-    // World edge: turn around instead of walking out.
-    if (p.axis === 'h' && (p.x < 40 || p.x > WORLD - 40)) p.dir = -p.dir;
-    if (p.axis === 'v' && (p.y < 40 || p.y > WORLD - 40)) p.dir = -p.dir;
-    p.x = Math.max(20, Math.min(WORLD - 20, p.x));
-    p.y = Math.max(20, Math.min(WORLD - 20, p.y));
+  function maintainPopulation() {
+    const p = playerPos();
+    // Despawn the far away, then top back up near the player.
+    for (let i = state.list.length - 1; i >= 0; i--) {
+      const ped = state.list[i];
+      if (!ped) continue;
+      if (Math.hypot(ped.x - p.x, ped.y - p.y) > PEDESTRIAN_DESPAWN_DISTANCE) {
+        if (ped.pairedWith) ped.pairedWith.pairedWith = null;
+        state.list.splice(i, 1);
+      }
+    }
+    let guard = 0;
+    while (state.list.length < PEDESTRIAN_TARGET_COUNT && guard++ < 8) {
+      if (!spawnNearPlayer()) break;
+    }
+    syncList();
+  }
+
+  function update(dt) {
+    const step = Math.max(0, Math.min(0.1, Number(dt) || 0.016));
+    if (!game || !game.state || game.state === 'playing') {
+      for (const ped of state.list) {
+        if (!ped || ped.dead) continue;
+        checkScares(ped);
+        if (ped.state === 'flee') stepFlee(ped, step);
+        else stepWalk(ped, step);
+      }
+      maintainPopulation();
+    }
+    return state;
+  }
+
+  function snapshot() {
+    let fleeing = 0;
+    let paired = 0;
+    for (const ped of state.list) {
+      if (ped.fleeing) fleeing += 1;
+      if (ped.paired) paired += 1;
+    }
+    return {
+      count: state.list.length,
+      fleeing,
+      paired,
+      spawned: state.spawned,
+      fled: state.fled,
+      pairsFormed: state.pairsFormed,
+    };
   }
 
   return {
-    update(dt) {
-      // Drain scares the game queued this frame.
-      if (Array.isArray(game.scares)) {
-        for (const s of game.scares) this.scare(s.x, s.y, s.radius || 260);
-        game.scares.length = 0;
-      }
-      const target = 26;
-      if (people.length < target && rng() < 0.4) {
-        const pl = game.player;
-        spawnPerson(pl ? pl.x : undefined, pl ? pl.y : undefined);
-      }
-      const pl = game.player;
-      if (people.length > target + 10) {
-        people = people.filter((p) => {
-          if (!pl) return true;
-          return Math.hypot(p.x - pl.x, p.y - pl.y) < 900;
-        });
-      }
-      for (const p of people) updatePerson(p, dt);
-    },
-
-    draw(ctx, cam) {
-      if (!ctx) return;
-      for (const p of people) {
-        if (cam) {
-          if (p.x < cam.x - 20 || p.x > cam.x + cam.w + 20 ||
-              p.y < cam.y - 20 || p.y > cam.y + cam.h + 20) continue;
-        }
-        ctx.save();
-        ctx.translate(p.x, p.y);
-        // Shadow.
-        ctx.fillStyle = 'rgba(20, 16, 60, 0.3)';
-        ctx.beginPath();
-        ctx.ellipse(2, 3, 6, 3, 0, 0, Math.PI * 2);
-        ctx.fill();
-        const scared = p.state === 'flee';
-        // Legs.
-        ctx.fillStyle = p.pants;
-        ctx.fillRect(-4, 1, 3, 7);
-        ctx.fillRect(1, 1, 3, 7);
-        // Body.
-        ctx.fillStyle = p.shirt;
-        ctx.fillRect(-5, -7, 10, 9);
-        // Head.
-        ctx.fillStyle = '#e8b98a';
-        ctx.beginPath();
-        ctx.arc(0, -10, 4, 0, Math.PI * 2);
-        ctx.fill();
-        if (scared) {
-          // Panic mark above the head.
-          ctx.fillStyle = '#ffdd00';
-          ctx.font = 'bold 11px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText('!', 0, -18);
-        }
-        ctx.restore();
-      }
-    },
-
-    list() { return people; },
-    count() { return people.length; },
-
-    scare(x, y, radius) {
-      const r = radius || 260;
-      for (const p of people) {
-        const d = Math.hypot(p.x - x, p.y - y);
-        if (d < r) {
-          p.state = 'flee';
-          p.fleeX = x;
-          p.fleeY = y;
-          p.fleeTime = 2.5 + rng() * 2;
-          p.speed = p.baseSpeed * 3.2;
-        }
-      }
-    },
-
-    // A carjacked driver: spawns at the car and runs away from the player.
-    spawnFleeing(x, y, color) {
-      const p = makePerson(x, y, { shirt: color || '#e74c3c' });
-      p.state = 'flee';
-      const pl = game.player;
-      p.fleeX = pl ? pl.x : x + 100;
-      p.fleeY = pl ? pl.y : y;
-      p.fleeTime = 4;
-      p.speed = p.baseSpeed * 3.2;
-      people.push(p);
-      return p;
-    },
-
-    clear() { people = []; },
+    state,
+    list: state.list,
+    update,
+    spawnPedestrian,
+    spawnNearPlayer,
+    scarePedestrians,
+    maintainPopulation,
+    snapshot,
   };
 }
+
+export default createPedestrians;
