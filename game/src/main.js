@@ -1061,7 +1061,12 @@ function fallbackCollectStep() {
   const p = game.player;
   for (const pk of game.pickups) {
     if (!pk || pk.taken || pk.kind !== 'money') continue;
-    if (dist(p, pk) < 40) {
+    // A drop counts at the same reach radius a goto stage counts as
+    // reached. The old 40 was tighter than the 70 the driving layer
+    // treats as "arrived": the m6 probe watched the car sit 69 from
+    // a drop for 70+ seconds — route empty, "arrived", speed frozen —
+    // while the drop never counted, so the stage timed out at 0/5.
+    if (dist(p, pk) < MISSION_REACH_RADIUS) {
       pk.taken = true;
       missionRuntime.collectDone += 1;
       if (game.audio && typeof game.audio.play === 'function') {
