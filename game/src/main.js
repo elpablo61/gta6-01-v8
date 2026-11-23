@@ -1407,6 +1407,18 @@ function setupShotPose() {
   if (pose.id === 'cover') poseRuntime.target = { x: 2600, y: 400 };
   if (pose.id === 'night') poseRuntime.target = { x: 2200, y: 400 };
   game.shotPose = poseId;
+  if (poseId !== 'start') {
+    // A gameplay pose is not the title screen: the title overlay is
+    // visible by default in the HTML, and boot never calls showTitle()
+    // for a shot pose — but nothing hid the overlay or left the title
+    // state either, so cover/mission/night were photographed with the
+    // menu covering the chase, the car and the shootout (the 2-second
+    // test failed: city and minimap readable, player car and police
+    // chase not). Only 'start' keeps the title. updateShotPose already
+    // runs from updatePlaying, so the pose keeps driving.
+    hideOverlay('title-screen');
+    game.state = 'playing';
+  }
   return true;
 }
 
