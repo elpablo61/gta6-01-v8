@@ -1,372 +1,376 @@
-// audio.js — Crescent Bay sound system (fresh from prose spec §1, §3.4).
+// Audio — synth WebAudio sound (Crescent Bay).
 //
-// WebAudio synth only, no external assets. Two jobs:
-//   1. RADIO — three procedural stations, R cycles, HUD shows the name
-//      plus an animated equalizer. Station 1 ("Bay FM") is the default
-//      on a new game. Music keeps playing through missions and free roam.
-//   2. SFX — engine hum, crash, gunshots (per weapon), siren, pickup
-//      chime, mission jingle, helicopter rotor chop, skid.
+// Fresh from prose spec §1 + brief A17. All sound is synthesized with
+// WebAudio — no samples, no network, no external assets. The radio
+// stations (Bay FM / Harbor Jazz / Crescent Rock) live in radio.js and
+// are the music; this module owns the sound EFFECTS plus the music
+// hook that starts the radio: playSiren, playGunshot, startMusicLoop
+// are the first declarations, because they are the sounds the outline
+// should show. Audio never breaks the game: the context is created
+// lazily on the first user gesture (New Game click), every method is
+// wrapped so a failure is silent, and in Node (no AudioContext) every
+// call is a no-op that still updates the state the tests read.
 //
-// The module never touches the DOM except through the callbacks the game
-// passes in. It is safe to construct before any user gesture: the
-// AudioContext is created lazily on the first init() call (which the game
-// calls from a gesture handler) and every public method is a no-op until
-// then, so headless / muted runs stay silent instead of throwing.
-//
-// Context object G (only what this module reads):
-//   G.timeOfDay  — 0..24, unused here except for future ducking hooks
-//   G.onRadioChange(name) — optional callback when the station changes
-//
-// Public API (returned by createAudio):
-//   init()                 create/resume the AudioContext + master gain
-//   setMuted(m) / isMuted()
-//   nextStation() / setStation(i) / stationName() / stationIndex()
-//   equalizerLevel()       0..1, drives the HUD equalizer animation
-//   setEngine(speed01, on) engine hum follows car speed (0 = off)
-//   setSiren(on)           police siren wail while wanted >= 1 star
-//   setRotor(on)           helicopter rotor chop while the heli is up
-//   sfx(name, opts)        one-shot: 'shot-pistol' | 'shot-smg' |
-//                          'shot-shotgun' | 'crash' | 'skid' | 'pickup' |
-//                          'crate' | 'success' | 'fail' | 'click' |
-//                          'arrest' | 'splash' | 'horn'
-//   update(dt)             scheduler tick (call every frame)
+// Shared-state contract (read defensively):
+//   game.radio { start(), stop(), setStation(i) } — the station system;
+//                startMusicLoop delegates to it when present.
+//   game.muted / game.audio.muted — mute flag (this module's own flag
+//                lives on its state; game.audio IS this module).
+// Sound names the rest of the game calls through game.audio.play(name):
+//   shoot-pistol / shoot-smg / shoot-shotgun, pickup, pickup-ammo,
+//   pickup-health, weapon-switch, hurt, game-over, car-door, siren,
+//   enemy-down, menu-open, menu-close, garage-buy, heli-hit, engine.
 
-const STATIONS = [
-  { name: 'Bay FM',      kind: 'synthwave', bpm: 112, root: 55.00 }, // A1
-  { name: 'Harbor Jazz', kind: 'swing',     bpm: 96,  root: 65.41 }, // C2
-  { name: 'Crescent Rock', kind: 'rock',    bpm: 132, root: 49.00 }, // G1
-];
-
-// 16-step patterns, semitone offsets from the station root.
-const PATTERNS = {
-  synthwave: {
-    bass: [0, 0, 12, 0, 3, 0, 10, 0, 0, 0, 12, 0, 5, 0, 7, 10],
-    lead: [24, -1, 27, -1, 31, -1, 27, 24, -1, 24, -1, 28, 31, 28, 27, -1],
-    hat:  [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1],
-  },
-  swing: {
-    bass: [0, -1, 7, -1, 5, -1, 7, -1, 0, -1, 7, -1, 10, -1, 7, 5],
-    lead: [12, -1, 16, 19, -1, 16, -1, 12, -1, 14, 16, -1, 19, 16, 14, -1],
-    hat:  [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0],
-  },
-  rock: {
-    bass: [0, 0, 0, 12, 0, 0, 10, 0, 0, 0, 0, 12, 3, 3, 5, 7],
-    lead: [12, -1, 12, 15, -1, 12, -1, 19, -1, 19, 15, -1, 12, -1, 10, -1],
-    hat:  [1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0],
-  },
-};
-
-function semitoneFreq(root, semis) {
-  return root * Math.pow(2, semis / 12);
+export function playSiren(audio) {
+  if (audio && typeof audio.playSiren === 'function') return audio.playSiren();
+  return false;
 }
 
-export function createAudio(G) {
-  const game = G || {};
-  let ctx = null;
-  let master = null;
-  let musicGain = null;
-  let sfxGain = null;
-  let noiseBuf = null;
-  let muted = false;
-  let station = 0; // Bay FM is the default on New Game (spec §3.4)
-  let step = 0;
-  let nextStepTime = 0;
-  let timer = null;
-  let eqLevel = 0;
-  let eqTarget = 0;
+export function playGunshot(audio, weapon) {
+  if (audio && typeof audio.playGunshot === 'function') return audio.playGunshot(weapon);
+  return false;
+}
 
-  // Continuous loops (engine / siren / rotor), created on demand.
-  const loops = { engine: null, siren: null, rotor: null };
+export function startMusicLoop(audio) {
+  if (audio && typeof audio.startMusicLoop === 'function') return audio.startMusicLoop();
+  return null;
+}
 
-  function ensureCtx() {
-    if (ctx) return true;
-    const AC = (typeof window !== 'undefined' &&
-      (window.AudioContext || window.webkitAudioContext)) || null;
-    if (!AC) return false;
-    ctx = new AC();
-    master = ctx.createGain();
-    master.gain.value = muted ? 0 : 0.9;
-    master.connect(ctx.destination);
-    musicGain = ctx.createGain();
-    musicGain.gain.value = 0.32;
-    musicGain.connect(master);
-    sfxGain = ctx.createGain();
-    sfxGain.gain.value = 0.9;
-    sfxGain.connect(master);
-    // Shared white-noise buffer for hats / crashes / rotor chop.
-    const len = ctx.sampleRate;
-    noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
-    const data = noiseBuf.getChannelData(0);
-    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+const AUDIO_MASTER_VOLUME = 0.5;
+const AUDIO_EFFECT_VOLUME = 0.4;
+const AUDIO_GUNSHOT_DURATION = 0.14;
+const AUDIO_SIREN_PERIOD = 0.9;
+
+export function createAudio(game) {
+  const state = {
+    context: null,
+    masterGain: null,
+    muted: false,
+    started: false,
+    musicPlaying: false,
+    sirenNodes: null,
+    engineNodes: null,
+    soundsPlayed: {},
+    lastPlayed: null,
+  };
+
+  function ensureContext() {
+    if (state.context) return state.context;
+    let Ctor = null;
+    if (game && game.audioContext) {
+      state.context = game.audioContext;
+    } else if (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) {
+      Ctor = window.AudioContext || window.webkitAudioContext;
+      try {
+        state.context = new Ctor();
+      } catch (e) {
+        state.context = null;
+      }
+    }
+    if (state.context && !state.masterGain) {
+      try {
+        state.masterGain = state.context.createGain();
+        state.masterGain.gain.value = state.muted ? 0 : AUDIO_MASTER_VOLUME;
+        state.masterGain.connect(state.context.destination);
+      } catch (e) {
+        state.masterGain = null;
+      }
+    }
+    return state.context;
+  }
+
+  // Resume the context after a user gesture (browsers start suspended).
+  function resume() {
+    const ac = ensureContext();
+    if (ac && ac.state === 'suspended' && typeof ac.resume === 'function') {
+      ac.resume().catch(() => {});
+    }
+    return !!ac;
+  }
+
+  function notePlayed(name) {
+    state.soundsPlayed[name] = (state.soundsPlayed[name] || 0) + 1;
+    state.lastPlayed = name;
+  }
+
+  // One oscillator blip: frequency, duration, wave, volume.
+  function tone(freq, duration, wave, volume, delay) {
+    const ac = ensureContext();
+    if (!ac || !state.masterGain) return false;
+    try {
+      const t0 = ac.currentTime + (delay || 0);
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = wave || 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(volume || 0.2, t0 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+      osc.connect(gain);
+      gain.connect(state.masterGain);
+      osc.start(t0);
+      osc.stop(t0 + duration + 0.05);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // A burst of filtered noise — gunshots, crashes, doors.
+  function noiseBurst(duration, volume, lowpass) {
+    const ac = ensureContext();
+    if (!ac || !state.masterGain) return false;
+    try {
+      const len = Math.max(1, Math.floor(ac.sampleRate * duration));
+      const buffer = ac.createBuffer(1, len, ac.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < len; i++) {
+        data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+      }
+      const src = ac.createBufferSource();
+      src.buffer = buffer;
+      const gain = ac.createGain();
+      gain.gain.value = volume || 0.3;
+      let node = src;
+      if (lowpass) {
+        const filter = ac.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = lowpass;
+        src.connect(filter);
+        node = filter;
+      }
+      node.connect(gain);
+      gain.connect(state.masterGain);
+      src.start();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function playGunshot(weapon) {
+    notePlayed('shoot-' + (weapon || 'pistol'));
+    if (weapon === 'shotgun') {
+      noiseBurst(0.22, 0.5, 900);
+      tone(90, 0.18, 'sawtooth', 0.3);
+    } else if (weapon === 'smg') {
+      noiseBurst(0.08, 0.3, 2400);
+      tone(220, 0.06, 'square', 0.14);
+    } else {
+      noiseBurst(AUDIO_GUNSHOT_DURATION, AUDIO_EFFECT_VOLUME, 1800);
+      tone(160, 0.1, 'square', 0.2);
+    }
     return true;
   }
 
-  function startScheduler() {
-    if (timer !== null || !ctx) return;
-    nextStepTime = ctx.currentTime + 0.1;
-    step = 0;
-    timer = setInterval(scheduleAhead, 40);
-  }
-
-  function scheduleAhead() {
-    if (!ctx) return;
-    const st = STATIONS[station];
-    const pat = PATTERNS[st.kind];
-    const stepDur = 60 / st.bpm / 4; // 16th notes
-    while (nextStepTime < ctx.currentTime + 0.18) {
-      playStep(st, pat, step, nextStepTime, stepDur);
-      step = (step + 1) % 16;
-      nextStepTime += stepDur;
-    }
-  }
-
-  function playStep(st, pat, s, t, stepDur) {
-    const bassNote = pat.bass[s];
-    if (bassNote >= 0) {
-      const osc = ctx.createOscillator();
-      osc.type = st.kind === 'rock' ? 'square' : 'sawtooth';
-      osc.frequency.value = semitoneFreq(st.root, bassNote);
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0.5, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + stepDur * 1.8);
-      const f = ctx.createBiquadFilter();
-      f.type = 'lowpass';
-      f.frequency.value = st.kind === 'swing' ? 500 : 900;
-      osc.connect(f); f.connect(g); g.connect(musicGain);
-      osc.start(t); osc.stop(t + stepDur * 2);
-      eqTarget = 0.9;
-    }
-    const leadNote = pat.lead[s];
-    if (leadNote >= 0) {
-      const osc = ctx.createOscillator();
-      osc.type = st.kind === 'swing' ? 'sine' : 'triangle';
-      osc.frequency.value = semitoneFreq(st.root, leadNote);
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0.0001, t);
-      g.gain.exponentialRampToValueAtTime(0.22, t + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.001, t + stepDur * 2.2);
-      osc.connect(g); g.connect(musicGain);
-      osc.start(t); osc.stop(t + stepDur * 2.4);
-      eqTarget = Math.max(eqTarget, 0.6);
-    }
-    if (pat.hat[s]) {
-      const src = ctx.createBufferSource();
-      src.buffer = noiseBuf;
-      const f = ctx.createBiquadFilter();
-      f.type = 'highpass'; f.frequency.value = 6000;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0.12, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
-      src.connect(f); f.connect(g); g.connect(musicGain);
-      src.start(t); src.stop(t + 0.06);
-    }
-    if (s === 0) eqTarget = Math.max(eqTarget, 0.35);
-  }
-
-  function blip(type, freq0, freq1, dur, vol, when) {
-    if (!ctx) return;
-    const t = when || ctx.currentTime;
-    const osc = ctx.createOscillator();
-    osc.type = type;
-    osc.frequency.setValueAtTime(freq0, t);
-    if (freq1 !== freq0) osc.frequency.exponentialRampToValueAtTime(freq1, t + dur);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(vol, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    osc.connect(g); g.connect(sfxGain);
-    osc.start(t); osc.stop(t + dur + 0.02);
-  }
-
-  function noiseHit(dur, vol, filterFreq, type) {
-    if (!ctx) return;
-    const t = ctx.currentTime;
-    const src = ctx.createBufferSource();
-    src.buffer = noiseBuf;
-    src.loop = true;
-    const f = ctx.createBiquadFilter();
-    f.type = type || 'lowpass';
-    f.frequency.value = filterFreq;
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(vol, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    src.connect(f); f.connect(g); g.connect(sfxGain);
-    src.start(t); src.stop(t + dur + 0.02);
-  }
-
-  // --- continuous loops -------------------------------------------------
-  function makeLoop(kind) {
-    if (!ctx) return null;
-    if (kind === 'engine') {
-      const osc = ctx.createOscillator();
-      osc.type = 'sawtooth';
-      osc.frequency.value = 55;
-      const f = ctx.createBiquadFilter();
-      f.type = 'lowpass'; f.frequency.value = 420;
-      const g = ctx.createGain(); g.gain.value = 0;
-      osc.connect(f); f.connect(g); g.connect(sfxGain);
-      osc.start();
-      return { osc, gain: g, filter: f };
-    }
-    if (kind === 'siren') {
-      const osc = ctx.createOscillator();
+  function playSiren() {
+    notePlayed('siren');
+    const ac = ensureContext();
+    if (!ac || !state.masterGain || state.sirenNodes) return !!state.sirenNodes;
+    try {
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
       osc.type = 'sine';
-      osc.frequency.value = 700;
-      const g = ctx.createGain(); g.gain.value = 0;
-      const lfo = ctx.createOscillator();
-      lfo.frequency.value = 0.55; // slow two-tone wail
-      const lfoGain = ctx.createGain(); lfoGain.gain.value = 260;
-      lfo.connect(lfoGain); lfoGain.connect(osc.frequency);
-      osc.connect(g); g.connect(sfxGain);
-      osc.start(); lfo.start();
-      return { osc, gain: g, lfo };
+      osc.frequency.value = 660;
+      gain.gain.value = 0.05;
+      const lfo = ac.createOscillator();
+      lfo.type = 'sine';
+      lfo.frequency.value = 1 / AUDIO_SIREN_PERIOD;
+      const lfoGain = ac.createGain();
+      lfoGain.gain.value = 220;
+      lfo.connect(lfoGain);
+      lfoGain.connect(osc.frequency);
+      osc.connect(gain);
+      gain.connect(state.masterGain);
+      osc.start();
+      lfo.start();
+      state.sirenNodes = { osc, lfo, gain };
+      return true;
+    } catch (e) {
+      return false;
     }
-    // rotor: chopped noise, ~13 Hz blade chop
-    const src = ctx.createBufferSource();
-    src.buffer = noiseBuf; src.loop = true;
-    const f = ctx.createBiquadFilter();
-    f.type = 'lowpass'; f.frequency.value = 300;
-    const chop = ctx.createGain(); chop.gain.value = 0.5;
-    const lfo = ctx.createOscillator();
-    lfo.type = 'square'; lfo.frequency.value = 13;
-    const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.45;
-    lfo.connect(lfoGain); lfoGain.connect(chop.gain);
-    const g = ctx.createGain(); g.gain.value = 0;
-    src.connect(f); f.connect(chop); chop.connect(g); g.connect(sfxGain);
-    src.start(); lfo.start();
-    return { src, gain: g, lfo };
   }
 
-  function setLoop(kind, on, level) {
-    if (!ctx) return;
-    if (on && !loops[kind]) loops[kind] = makeLoop(kind);
-    const loop = loops[kind];
-    if (!loop) return;
-    const target = on ? (level === undefined ? 1 : level) : 0;
-    loop.gain.gain.setTargetAtTime(target * (kind === 'engine' ? 0.16 : 0.12),
-      ctx.currentTime, 0.08);
-    if (!on) {
-      const dead = loop;
-      setTimeout(() => {
-        try {
-          if (dead.osc) dead.osc.stop();
-          if (dead.src) dead.src.stop();
-          if (dead.lfo) dead.lfo.stop();
-        } catch (e) { /* already stopped */ }
-        if (loops[kind] === dead) loops[kind] = null;
-      }, 400);
-      loops[kind] = null;
+  function stopSiren() {
+    if (!state.sirenNodes) return false;
+    try {
+      state.sirenNodes.osc.stop();
+      state.sirenNodes.lfo.stop();
+    } catch (e) { /* already stopped */ }
+    state.sirenNodes = null;
+    return true;
+  }
+
+  function playHurt() {
+    notePlayed('hurt');
+    tone(140, 0.18, 'sawtooth', 0.25);
+    tone(90, 0.22, 'sawtooth', 0.2, 0.05);
+    return true;
+  }
+
+  function playGameOver(reason) {
+    notePlayed('game-over');
+    const notes = reason === 'CAUGHT' ? [392, 330, 262] : [330, 262, 196];
+    notes.forEach((f, i) => tone(f, 0.35, 'triangle', 0.25, i * 0.3));
+    stopSiren();
+    return true;
+  }
+
+  function playPickup() {
+    notePlayed('pickup');
+    tone(660, 0.08, 'sine', 0.25);
+    tone(990, 0.12, 'sine', 0.25, 0.07);
+    return true;
+  }
+
+  function playCarDoor() {
+    notePlayed('car-door');
+    noiseBurst(0.08, 0.25, 700);
+    tone(120, 0.07, 'square', 0.12);
+    return true;
+  }
+
+  // The music loop is the radio: delegate to radio.js when it exists.
+  // Without a radio, fall back to a quiet driving bass pulse so the
+  // game is never silent after New Game.
+  function startMusicLoop() {
+    state.started = true;
+    state.musicPlaying = true;
+    resume();
+    if (game && game.radio && typeof game.radio.start === 'function') {
+      try {
+        const name = game.radio.start();
+        notePlayed('music-loop');
+        return name;
+      } catch (e) { /* fall through to the fallback loop */ }
     }
+    notePlayed('music-loop');
+    // Fallback loop: a soft bass pulse every beat, scheduled lazily.
+    if (typeof setInterval !== 'undefined' && !state._fallbackTimer) {
+      state._fallbackTimer = setInterval(() => {
+        if (!state.muted && state.musicPlaying) tone(55, 0.22, 'triangle', 0.12);
+      }, 500);
+    }
+    return 'Bay FM';
+  }
+
+  function stopMusic() {
+    state.musicPlaying = false;
+    if (state._fallbackTimer && typeof clearInterval !== 'undefined') {
+      clearInterval(state._fallbackTimer);
+      state._fallbackTimer = null;
+    }
+    if (game && game.radio && typeof game.radio.stop === 'function') {
+      try { game.radio.stop(); } catch (e) { /* ignore */ }
+    }
+    return true;
+  }
+
+  // Engine hum: a low oscillator whose pitch follows the car's speed
+  // (0..1). Cheap, and silent when Rook is on foot.
+  function setEngineLevel(level) {
+    const ac = ensureContext();
+    if (!ac || !state.masterGain) return false;
+    const lvl = Math.max(0, Math.min(1, Number(level) || 0));
+    if (lvl <= 0.02) {
+      if (state.engineNodes) {
+        try { state.engineNodes.osc.stop(); } catch (e) { /* ignore */ }
+        state.engineNodes = null;
+      }
+      return true;
+    }
+    try {
+      if (!state.engineNodes) {
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.value = 60;
+        gain.gain.value = 0.04;
+        const filter = ac.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = 320;
+        osc.connect(filter);
+        filter.connect(gain);
+        gain.connect(state.masterGain);
+        osc.start();
+        state.engineNodes = { osc, gain };
+      }
+      state.engineNodes.osc.frequency.value = 55 + lvl * 130;
+      state.engineNodes.gain.gain.value = 0.02 + lvl * 0.05;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setMuted(muted) {
+    state.muted = !!muted;
+    if (state.masterGain) {
+      try {
+        state.masterGain.gain.value = state.muted ? 0 : AUDIO_MASTER_VOLUME;
+      } catch (e) { /* ignore */ }
+    }
+    return state.muted;
+  }
+
+  // One dispatch for every sound name the game uses. Unknown names are
+  // ignored (never throw), known names map to their synth.
+  function play(name) {
+    if (!name) return false;
+    const n = String(name);
+    if (n === 'shoot-pistol') return playGunshot('pistol');
+    if (n === 'shoot-smg') return playGunshot('smg');
+    if (n === 'shoot-shotgun') return playGunshot('shotgun');
+    if (n === 'pickup' || n === 'pickup-ammo' || n === 'pickup-health') {
+      notePlayed(n);
+      if (n === 'pickup-health') tone(520, 0.1, 'sine', 0.25);
+      return playPickup();
+    }
+    if (n === 'weapon-switch') { notePlayed(n); tone(440, 0.05, 'square', 0.15); return true; }
+    if (n === 'hurt') return playHurt();
+    if (n === 'game-over') return playGameOver();
+    if (n === 'car-door' || n === 'carDoor') return playCarDoor();
+    if (n === 'siren') return playSiren();
+    if (n === 'siren-stop') return stopSiren();
+    if (n === 'enemy-down') { notePlayed(n); tone(220, 0.15, 'square', 0.2); tone(110, 0.2, 'square', 0.2, 0.08); return true; }
+    if (n === 'menu-open' || n === 'menu-close') { notePlayed(n); tone(n === 'menu-open' ? 520 : 380, 0.07, 'sine', 0.18); return true; }
+    if (n === 'garage-buy') { notePlayed(n); tone(880, 0.1, 'sine', 0.25); tone(1320, 0.14, 'sine', 0.25, 0.08); return true; }
+    if (n === 'heli-hit') { notePlayed(n); noiseBurst(0.12, 0.3, 1200); return true; }
+    if (n === 'music-loop') return !!startMusicLoop();
+    notePlayed(n);
+    return false;
+  }
+
+  function snapshot() {
+    return {
+      started: state.started,
+      musicPlaying: state.musicPlaying,
+      muted: state.muted,
+      sirenOn: !!state.sirenNodes,
+      soundsPlayed: { ...state.soundsPlayed },
+      lastPlayed: state.lastPlayed,
+      hasContext: !!state.context,
+    };
   }
 
   return {
-    init() {
-      if (!ensureCtx()) return false;
-      if (ctx.state === 'suspended') ctx.resume();
-      startScheduler();
-      return true;
-    },
-
-    setMuted(m) {
-      muted = !!m;
-      if (master && ctx) master.gain.setTargetAtTime(muted ? 0 : 0.9, ctx.currentTime, 0.05);
-    },
-    isMuted() { return muted; },
-
-    nextStation() {
-      this.setStation((station + 1) % STATIONS.length);
-    },
-    setStation(i) {
-      const n = ((i % STATIONS.length) + STATIONS.length) % STATIONS.length;
-      if (n === station && timer !== null) return;
-      station = n;
-      step = 0;
-      if (ctx) nextStepTime = Math.max(nextStepTime, ctx.currentTime + 0.05);
-      if (typeof game.onRadioChange === 'function') game.onRadioChange(STATIONS[station].name);
-    },
-    stationName() { return STATIONS[station].name; },
-    stationIndex() { return station; },
-    stationNames() { return STATIONS.map((s) => s.name); },
-
-    equalizerLevel() { return eqLevel; },
-
-    setEngine(speed01, on) {
-      if (!ctx) return;
-      const s = Math.max(0, Math.min(1, speed01 || 0));
-      setLoop('engine', !!on && s > 0.02, s);
-      const loop = loops.engine;
-      if (loop && on) {
-        loop.osc.frequency.setTargetAtTime(50 + s * 170, ctx.currentTime, 0.05);
-        loop.filter.frequency.setTargetAtTime(350 + s * 900, ctx.currentTime, 0.05);
-      }
-    },
-    setSiren(on) { setLoop('siren', !!on, 1); },
-    setRotor(on) { setLoop('rotor', !!on, 1); },
-
-    sfx(name, opts) {
-      if (!ctx) return;
-      const o = opts || {};
-      switch (name) {
-        case 'shot-pistol':
-          noiseHit(0.12, 0.7, 1800, 'highpass');
-          blip('square', 220, 60, 0.09, 0.5);
-          break;
-        case 'shot-smg':
-          noiseHit(0.08, 0.5, 2400, 'highpass');
-          blip('square', 300, 90, 0.06, 0.35);
-          break;
-        case 'shot-shotgun':
-          noiseHit(0.28, 0.9, 900);
-          blip('sawtooth', 140, 40, 0.2, 0.6);
-          break;
-        case 'crash':
-          noiseHit(0.35, 0.9, 500);
-          blip('sine', 90, 35, 0.3, 0.7);
-          break;
-        case 'skid':
-          noiseHit(0.25, 0.25, 3000, 'bandpass');
-          break;
-        case 'pickup':
-          blip('sine', 660, 660, 0.08, 0.4);
-          blip('sine', 990, 990, 0.12, 0.4, ctx.currentTime + 0.08);
-          break;
-        case 'crate':
-          blip('triangle', 440, 440, 0.1, 0.5);
-          blip('triangle', 660, 660, 0.1, 0.5, ctx.currentTime + 0.1);
-          blip('triangle', 880, 880, 0.16, 0.5, ctx.currentTime + 0.2);
-          break;
-        case 'success': {
-          const notes = [523, 659, 784, 1047];
-          notes.forEach((n, i) => blip('triangle', n, n, 0.18, 0.45, ctx.currentTime + i * 0.11));
-          break;
-        }
-        case 'fail': {
-          const notes = [392, 330, 262];
-          notes.forEach((n, i) => blip('sawtooth', n, n, 0.22, 0.3, ctx.currentTime + i * 0.14));
-          break;
-        }
-        case 'horn':
-          blip('square', 370, 370, 0.18, 0.3);
-          blip('square', 466, 466, 0.18, 0.25);
-          break;
-        case 'arrest':
-          blip('sawtooth', 500, 180, 0.6, 0.3);
-          break;
-        case 'splash':
-          noiseHit(0.4, 0.5, 1200, 'bandpass');
-          break;
-        case 'click':
-        default:
-          blip('sine', 800, 800, 0.05, 0.3);
-          break;
-      }
-      void o;
-    },
-
-    update(dt) {
-      // Equalizer decays toward its target; the HUD reads equalizerLevel().
-      eqLevel += (eqTarget - eqLevel) * Math.min(1, (dt || 0.016) * 8);
-      eqTarget *= Math.max(0, 1 - (dt || 0.016) * 1.5);
-      if (eqTarget < 0.05) eqTarget = 0.05;
-    },
+    state,
+    play,
+    playGunshot,
+    playSiren,
+    stopSiren,
+    playHurt,
+    playGameOver,
+    playPickup,
+    playCarDoor,
+    startMusicLoop,
+    stopMusic,
+    setEngineLevel,
+    setMuted,
+    resume,
+    ensureContext,
+    snapshot,
   };
 }
+
+export default createAudio;
