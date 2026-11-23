@@ -114,6 +114,7 @@ export const AUTOPILOT_WALK_MEMO_DISTANCE = 120;
 export const AUTOPILOT_SHOOT_BURST_INTERVAL = 0.45;
 export const AUTOPILOT_SHOOT_RANGE = 260;
 export const AUTOPILOT_LOW_AMMO = 6;
+export const AUTOPILOT_LOW_HEALTH = 50;
 export const AUTOPILOT_RAM_DISTANCE = 70;
 export const AUTOPILOT_RAM_SPEED = 120;
 export const AUTOPILOT_STUCK_SECONDS = 4;
@@ -720,6 +721,19 @@ export function createAutopilot(game) {
     return null;
   }
 
+  function nearestHealthPoint() {
+    const p = playerObj();
+    if (!p) return null;
+    let best = null, bestD = Infinity;
+    for (const pk of game && game.pickups ? game.pickups : []) {
+      if (!pk || pk.taken || pk.kind !== 'health') continue;
+      const d = Math.hypot(pk.x - p.x, pk.y - p.y);
+      if (d < bestD) { bestD = d; best = pk; }
+    }
+    if (best) return { x: best.x, y: best.y, kind: 'health' };
+    return null;
+  }
+
   function betterCratePoint() {
     const p = playerObj();
     if (!p) return null;
@@ -739,6 +753,17 @@ export function createAutopilot(game) {
   function stepShootout(dt) {
     const p = playerObj();
     if (!p) return;
+    // Hurt first: when health is low, walk to the nearest health
+    // pickup before fighting on. The m8 probe watched Rook stand at
+    // HP 28 taking fire while two +30 pickups sat 400 units away at
+    // the arena — the shootout never looked for them.
+    if (p.health <= AUTOPILOT_LOW_HEALTH) {
+      const hpPt = nearestHealthPoint();
+      if (hpPt) {
+        const arrived = walkToward(hpPt, dt);
+        if (!arrived) return;
+      }
+    }
     // Low ammo first: walk to the nearest ammo pickup.
     if (currentAmmo() <= AUTOPILOT_LOW_AMMO) {
       const ammoPt = nearestAmmoPoint();
