@@ -602,6 +602,8 @@ const missionRuntime = {
   collectTotal: 0,
   collectDone: 0,
   arenaSpawned: false,
+  arenaId: null,
+  arenaStage: -1,
   escapeHeatSet: false,
   offerCooldownUntil: 0,
   lastOfferedId: null,
@@ -625,6 +627,8 @@ function clearMissionLeftovers(nextId) {
     game.pickups = game.pickups.filter((pk) => pk && pk.kind !== 'money' && pk.kind !== 'arena');
   }
   missionRuntime.arenaSpawned = false;
+  missionRuntime.arenaId = null;
+  missionRuntime.arenaStage = -1;
   missionRuntime.escapeHeatSet = false;
   missionRuntime.ramHits = 0;
   missionRuntime.collectDone = 0;
@@ -970,8 +974,17 @@ function beginFallbackStage(id, stage) {
   if (!def) return;
   const step = (def.stages || [])[Math.min(stage, (def.stages || []).length - 1)];
   if (!step) return;
+  // One arena per mission + stage, however many times this stage is
+  // (re)entered: startMissionById and the handoff watch both call
+  // here for the same first sight, and the old blind reset of
+  // arenaSpawned made each call spawn a full arena — m8 ran with 6
+  // enemies instead of the spec's 3, and m6 got 10 money drops
+  // instead of 5. The stamp below is the guard; a fresh start clears
+  // it in clearMissionLeftovers, a new stage carries a new stamp.
+  if (missionRuntime.arenaId === id && missionRuntime.arenaStage === stage) return;
+  missionRuntime.arenaId = id;
+  missionRuntime.arenaStage = stage;
   missionRuntime.stageKind = step.kind;
-  missionRuntime.arenaSpawned = false;
   missionRuntime.escapeHeatSet = false;
   if (step.kind === 'shootout' && !missionRuntime.arenaSpawned) {
     const count = step.enemies || 3;
@@ -1934,6 +1947,7 @@ function publishDebugSnapshot() {
 
 let lastTimestamp = 0;
 let lastSirenOn = false;
+let gameOverSeenAtMs = 0;
 
 function advanceClock(dt) {
   game.now += dt;
@@ -2069,6 +2083,13 @@ function updatePlaying(dt) {
   if (game.combat && typeof game.combat.update === 'function') {
     try { game.combat.update(dt); } catch (e) { /* ignore */ }
   }
+  // Death can land inside combat.update (an enemy bullet), after the
+  // game-over check above already passed this frame. Show the overlay
+  // now instead of leaving the next frame to discover a frozen state.
+  if (game.state === 'gameover' || (game.gameOver && game.gameOver.reason)) {
+    showGameOver(game.gameOver.reason || 'DOWN');
+    return;
+  }
   updateTraffic(game, dt);
   if (game.pedestrians && typeof game.pedestrians.update === 'function') {
     try { game.pedestrians.update(dt); } catch (e) { /* ignore */ }
@@ -2121,6 +2142,9 @@ function frame(timestamp) {
 
   syncInputFromRaw();
 
+  // The game-over timer only runs while the game-over state lasts.
+  if (game.state !== 'gameover') gameOverSeenAtMs = 0;
+
   // Pause first, before any state early-exit: a paused game must
   // always be unpausable, and the garage menu closes on Esc too.
   if (game.input.pausePressed()) {
@@ -2144,7 +2168,23 @@ function frame(timestamp) {
     }
     updateShotPose(dt);
   } else if (game.state === 'gameover') {
-    // Frozen frame behind the game-over overlay; nothing updates.
+    // A death that lands mid-frame (an enemy bullet via combat.update)
+    // used to freeze here forever: updatePlaying() never ran again,
+    // so showGameOver() was never called, the overlay never appeared
+    // and no respawn button existed. Show the overlay from the frame
+    // loop itself — the one choke point every death passes through.
+    // While the autopilot drives, take the respawn for it after a
+    // short beat so a failed mission restarts from stage 0 instead of
+    // waiting on a human click; a human player still clicks the
+    // button herself.
+    if (game.gameOver) showGameOver(game.gameOver.reason || 'DOWN');
+    if (game.autopilotEnabled) {
+      if (!gameOverSeenAtMs) gameOverSeenAtMs = Date.now();
+      else if (Date.now() - gameOverSeenAtMs > 1500) {
+        gameOverSeenAtMs = 0;
+        respawn();
+      }
+    }
   }
   // 'paused' updates nothing at all.
 
