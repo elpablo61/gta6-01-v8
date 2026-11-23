@@ -1874,6 +1874,10 @@ function publishDebugSnapshot() {
     missionId: m ? m.id : null,
     missionStage: m && typeof m.stage === 'number' ? m.stage : 0,
     missionComplete: !!game.missionComplete,
+    // Which mission completed — the boolean alone is sticky (it stays
+    // true after m1), so a reader waiting on m2 would take m1's flag
+    // as its own completion. The id makes the signal per-mission.
+    missionCompleteId: game.missionCompleteId || null,
     completedMissions: game.completedMissions.slice(),
     highestMission: game.highestMission,
     cash: p.cash || 0,

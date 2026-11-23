@@ -280,7 +280,7 @@ async function readPageState(page) {
       if (d && typeof d === 'object') {
         debug = {};
         for (const field of [
-          'missionId', 'missionStage', 'missionComplete', 'completedMissions',
+          'missionId', 'missionStage', 'missionComplete', 'missionCompleteId', 'completedMissions',
           'highestMission', 'cash', 'health', 'ammo', 'weapon', 'radio',
           'heat', 'stars', 'inCar', 'speed', 'x', 'y', 'dialogOpen',
           'gameOver', 'autopilot', 'enemiesLeft', 'timeLeft',
@@ -764,7 +764,17 @@ async function runEdge(browser, baseUrl, run) {
 function arcCompleteSignal(state, mission) {
   // Returns 'complete' | 'failed' | 'active' | 'unknown'.
   const d = state.debug;
-  if (d && d.missionComplete === true) return 'complete';
+  // The completion flag is only meaningful for THIS mission: the
+  // flag stays set after m1 completes, so an unqualified read would
+  // "complete" m2–m12 in zero seconds (the arc run 2 false pass).
+  // The game publishes missionCompleteId alongside the flag.
+  if (d && d.missionComplete === true && d.missionCompleteId === mission.id) return 'complete';
+  if (d && d.missionComplete === true && typeof d.missionCompleteId !== 'string') {
+    // No id published (older build): only trust the flag together
+    // with the completed-missions list naming this mission.
+    if (!completedMissionsFromState(state).has(mission.id)) return 'unknown';
+    return 'complete';
+  }
   if (completedMissionsFromState(state).has(mission.id)) return 'complete';
   const dialogText = state.overlays['mission-dialog'] ? state.overlays['mission-dialog'].text : '';
   if (overlayVisible(state, 'mission-dialog') && /mission complete|complete!|reward/i.test(dialogText)) {
