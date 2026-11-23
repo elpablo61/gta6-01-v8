@@ -318,7 +318,7 @@ export function driveCarToward(car, tx, ty, cruise, dt, world, now = 0, opts = {
   if (!car.recover) {
     const dest = car.routeDest;
     const moved = !dest || Math.hypot(tx - dest.x, ty - dest.y) > ROUTE_REBUILD_DISTANCE;
-    if (!car.route.length || moved) {
+    if (!car.route || !car.route.length || moved) {
       car.route = buildRoute(car.x, car.y, tx, ty, { finalLeg: !!opts.finalLeg });
       car.routeDest = { x: tx, y: ty };
     }
