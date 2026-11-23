@@ -1,307 +1,390 @@
-// world.js — the city of Crescent Bay: its roads, districts, buildings,
-// beach, landmarks, and the road-graph router every driver in the game
-// uses (traffic, police, the autopilot, mission couriers).
+// Crescent Bay — the city: roads, districts, buildings, beach, marina.
+// The world is a fixed 3200x3200 map built once from a seeded generator,
+// so every fresh game has the same streets, the same blocks and the same
+// landmarks. Nothing here moves; traffic, pedestrians and the player all
+// navigate on the road graph this module builds.
 //
-// Layout (from the prose spec, section 1):
-//   * The world is 3200 x 3200 units.
-//   * An 8 x 8 road grid: roads run at 200 + i * 400 for i = 0..7, both
-//     directions, each 64 units wide. The crossings are the junctions.
-//   * Districts: Northside (houses) in the north, Old Town (brick) in the
-//     west-centre, Downtown (glass towers) in the centre-east, Waterfront
-//     (sand) along the east, South Docks (industrial) in the south.
-//   * Beach and open water at the east edge (x > 3060), with a marina and
-//     a pier reaching into the water.
-//   * Buildings are drawn 2.5D: a roof plus darker south and east sides,
-//     with blue-purple shadows falling to the south-east (the sun stands
-//     in the north-west).
-//   * A day/night cycle drives the light, the headlights and the traffic
-//     density.
-//
-// Routing: junctions are indexed row-major, id = row * 8 + col, and the
-// BFS parent chain is walked with that same indexing everywhere. (An
-// earlier build transposed the index and looped forever; the index is
-// built once, in one place, and never recomputed ad hoc.)
+// Road graph (the one rule everything else depends on):
+//   * 8 roads run north-south and 8 run east-west, at 200 + i * 400
+//     (200, 600, 1000, 1400, 1800, 2200, 2600, 3000), each 64 wide.
+//   * A junction is where a north-south road meets an east-west road.
+//   * Junction ids are row-major and CONSISTENT: id = row * 8 + col,
+//     where col comes from x and row comes from y. Never swap them —
+//     a transposed index once made the parent-chain walk cycle forever
+//     and froze the whole page.
+//   * Routes are found by BFS over junction ids and ALWAYS include the
+//     first junction as the first waypoint, so a car drives along its
+//     own road to the intersection instead of cutting diagonally
+//     across a block.
 
-import { SeededRandom, WORLD_SEED, hashCoords } from './random.js';
+import { Rng, WORLD_SEED } from './random.js';
 
 export const WORLD_SIZE = 3200;
+export const WORLD_WIDTH = 3200;
+export const WORLD_HEIGHT = 3200;
 export const ROAD_COUNT = 8;
 export const ROAD_SPACING = 400;
 export const ROAD_OFFSET = 200;
 export const ROAD_WIDTH = 64;
 export const ROAD_HALF = ROAD_WIDTH / 2;
-export const BEACH_START = 3032;
-export const WATER_START = 3060;
+export const SIDEWALK = 16;
+export const WATER_EDGE_X = 3060;
+export const BEACH_EDGE_X = 2960;
 
-// Road centre lines, in world units.
-export const ROAD_LINES = [];
-for (let i = 0; i < ROAD_COUNT; i++) ROAD_LINES.push(ROAD_OFFSET + i * ROAD_SPACING);
+// Player spawn: clear of the mission-garage trigger radius, so no dialog
+// opens the moment the game starts and swallows the first key press.
+export const PLAYER_SPAWN = { x: 600, y: 800 };
 
-export const DISTRICTS = {
-  northside: { name: 'Northside', kind: 'houses' },
-  oldtown: { name: 'Old Town', kind: 'brick' },
-  downtown: { name: 'Downtown', kind: 'towers' },
-  waterfront: { name: 'Waterfront', kind: 'sand' },
-  docks: { name: 'South Docks', kind: 'industrial' },
-};
-
-// Which district a point belongs to. Waterfront hugs the east edge,
-// the docks hold the south, Downtown sits centre-east, Old Town
-// west-centre, and everything north is Northside houses.
-export function districtAt(x, y) {
-  if (x >= 2600) return 'waterfront';
-  if (y >= 2600) return 'docks';
-  if (x >= 1800 && y >= 1400 && y < 2600) return 'downtown';
-  if (x < 1400 && y >= 1000 && y < 2600) return 'oldtown';
-  return 'northside';
+// Centre line of road number i (0..7).
+export function roadCoord(i) {
+  return ROAD_OFFSET + i * ROAD_SPACING;
 }
 
-export function isWater(x, y) {
-  return x > WATER_START;
+export const ROAD_LINES = [0, 1, 2, 3, 4, 5, 6, 7].map(roadCoord);
+
+// Clamp an index into the 0..7 road range.
+export function clampRoadIndex(i) {
+  return Math.max(0, Math.min(ROAD_COUNT - 1, i));
 }
 
-export function isBeach(x, y) {
-  return x > BEACH_START && x <= WATER_START;
+// Junction id from column (x) and row (y). Row-major, always.
+export function junctionId(col, row) {
+  return clampRoadIndex(row) * ROAD_COUNT + clampRoadIndex(col);
 }
 
-export function isOnRoad(x, y) {
+// Column / row of a junction id.
+export function junctionCol(id) {
+  return id % ROAD_COUNT;
+}
+
+export function junctionRow(id) {
+  return Math.floor(id / ROAD_COUNT);
+}
+
+// World position of a junction id.
+export function junctionPos(id) {
+  return { x: roadCoord(junctionCol(id)), y: roadCoord(junctionRow(id)) };
+}
+
+// Nearest junction id to a world point. The column is derived from x,
+// the row from y — this is the consistency the route finder relies on.
+export function nearestJunctionId(x, y) {
+  const col = clampRoadIndex(Math.round((x - ROAD_OFFSET) / ROAD_SPACING));
+  const row = clampRoadIndex(Math.round((y - ROAD_OFFSET) / ROAD_SPACING));
+  return junctionId(col, row);
+}
+
+export function nearestJunction(x, y) {
+  return junctionPos(nearestJunctionId(x, y));
+}
+
+// Neighbour junction ids (up/down/left/right, staying inside the grid).
+export function junctionNeighbours(id) {
+  const col = junctionCol(id);
+  const row = junctionRow(id);
+  const out = [];
+  if (col > 0) out.push(junctionId(col - 1, row));
+  if (col < ROAD_COUNT - 1) out.push(junctionId(col + 1, row));
+  if (row > 0) out.push(junctionId(col, row - 1));
+  if (row < ROAD_COUNT - 1) out.push(junctionId(col, row + 1));
+  return out;
+}
+
+// BFS over junction ids. Returns the list of junction ids from start to
+// goal inclusive, or null if no path exists (it always exists on a full
+// grid, but callers must handle null anyway). The parent chain is walked
+// with a visited set and a hard step cap, so it can never cycle forever.
+export function findJunctionPath(fromId, toId) {
+  if (fromId === toId) return [fromId];
+  const parent = new Int16Array(ROAD_COUNT * ROAD_COUNT).fill(-1);
+  const seen = new Uint8Array(ROAD_COUNT * ROAD_COUNT);
+  const queue = [fromId];
+  seen[fromId] = 1;
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head];
+    head += 1;
+    for (const next of junctionNeighbours(cur)) {
+      if (seen[next]) continue;
+      seen[next] = 1;
+      parent[next] = cur;
+      if (next === toId) {
+        // Walk the parent chain back to the start. Guarded: at most one
+        // step per junction, and a visited check breaks any bad chain.
+        const path = [toId];
+        const walked = new Set([toId]);
+        let node = toId;
+        let guard = 0;
+        while (node !== fromId && guard < ROAD_COUNT * ROAD_COUNT + 2) {
+          node = parent[node];
+          if (node < 0 || walked.has(node)) return null;
+          walked.add(node);
+          path.push(node);
+          guard += 1;
+        }
+        if (node !== fromId) return null;
+        path.reverse();
+        return path;
+      }
+      queue.push(next);
+    }
+  }
+  return null;
+}
+
+// Route between two world points as a list of {x, y} waypoints.
+// The FIRST waypoint is always the junction nearest the start, so the
+// driver travels along its own road first and never cuts a block corner.
+// The last waypoint is the junction nearest the target; callers driving
+// to a fixed landmark add the final straight leg themselves.
+export function findRoute(fromX, fromY, toX, toY) {
+  const fromJ = nearestJunctionId(fromX, fromY);
+  const toJ = nearestJunctionId(toX, toY);
+  const ids = findJunctionPath(fromJ, toJ);
+  if (!ids) return [junctionPos(fromJ)];
+  return ids.map(junctionPos);
+}
+
+export const findRoutePoints = findRoute;
+export const routeBetween = findRoute;
+
+// Nearest point on any road centre line to (x, y).
+export function nearestRoadPoint(x, y) {
+  let bestX = ROAD_LINES[0];
+  let bestDx = Math.abs(x - bestX);
   for (const line of ROAD_LINES) {
-    if (Math.abs(x - line) <= ROAD_HALF || Math.abs(y - line) <= ROAD_HALF) return true;
+    const d = Math.abs(x - line);
+    if (d < bestDx) {
+      bestDx = d;
+      bestX = line;
+    }
+  }
+  let bestY = ROAD_LINES[0];
+  let bestDy = Math.abs(y - bestY);
+  for (const line of ROAD_LINES) {
+    const d = Math.abs(y - line);
+    if (d < bestDy) {
+      bestDy = d;
+      bestY = line;
+    }
+  }
+  // The closer of the nearest vertical road and the nearest horizontal one.
+  if (bestDx <= bestDy) return { x: bestX, y };
+  return { x, y: bestY };
+}
+
+// True when (x, y) lies within tol of a road centre line.
+export function pointOnRoad(x, y, tol = 42) {
+  for (const line of ROAD_LINES) {
+    if (Math.abs(x - line) <= tol || Math.abs(y - line) <= tol) return true;
   }
   return false;
 }
 
-// Clamp a point into the world, keeping a margin from the edge.
-export function clampToWorld(x, y, margin) {
-  const m = margin === undefined ? 40 : margin;
-  return {
-    x: Math.max(m, Math.min(WORLD_SIZE - m, x)),
-    y: Math.max(m, Math.min(WORLD_SIZE - m, y)),
-  };
-}
-
-// The junction at (col, row): the crossing of road col and road row.
-export function junctionAt(col, row) {
-  return { x: ROAD_LINES[col], y: ROAD_LINES[row], col, row, id: row * ROAD_COUNT + col };
-}
-
-export function junctionById(id) {
-  const row = Math.floor(id / ROAD_COUNT);
-  const col = id % ROAD_COUNT;
-  return junctionAt(col, row);
-}
-
-// Nearest junction to a point (by grid, not by search).
-export function nearestJunction(x, y) {
-  const col = Math.max(0, Math.min(ROAD_COUNT - 1, Math.round((x - ROAD_OFFSET) / ROAD_SPACING)));
-  const row = Math.max(0, Math.min(ROAD_COUNT - 1, Math.round((y - ROAD_OFFSET) / ROAD_SPACING)));
-  return junctionAt(col, row);
-}
-
-// Nearest point on any road to (x, y): snap to the closest road line.
-export function nearestRoadPoint(x, y) {
-  let best = null;
-  let bestDist = Infinity;
+// Distance from (x, y) to the nearest road centre line.
+export function distanceToRoad(x, y) {
+  let best = Infinity;
   for (const line of ROAD_LINES) {
-    const dVertical = Math.abs(x - line);
-    if (dVertical < bestDist) {
-      bestDist = dVertical;
-      best = { x: line, y: Math.max(0, Math.min(WORLD_SIZE, y)) };
-    }
-    const dHorizontal = Math.abs(y - line);
-    if (dHorizontal < bestDist) {
-      bestDist = dHorizontal;
-      best = { x: Math.max(0, Math.min(WORLD_SIZE, x)), y: line };
-    }
+    best = Math.min(best, Math.abs(x - line), Math.abs(y - line));
   }
   return best;
 }
 
-// Breadth-first route over the junction graph. Returns an array of
-// waypoints [{x, y}, ...] from the junction nearest `from` to the junction
-// nearest `to`, INCLUDING the first junction as the first waypoint: a
-// driver must never cut diagonally across a block. Neighbours are the
-// four orthogonal junctions; the graph is a plain grid so BFS is exact.
-export function findRoute(fromX, fromY, toX, toY) {
-  const start = nearestJunction(fromX, fromY);
-  const goal = nearestJunction(toX, toY);
-  if (start.id === goal.id) return [{ x: goal.x, y: goal.y }];
-
-  const parent = new Int32Array(ROAD_COUNT * ROAD_COUNT).fill(-1);
-  const queue = [start.id];
-  parent[start.id] = start.id;
-  let head = 0;
-  while (head < queue.length) {
-    const current = queue[head++];
-    if (current === goal.id) break;
-    const row = Math.floor(current / ROAD_COUNT);
-    const col = current % ROAD_COUNT;
-    const neighbours = [];
-    if (col > 0) neighbours.push(current - 1);
-    if (col < ROAD_COUNT - 1) neighbours.push(current + 1);
-    if (row > 0) neighbours.push(current - ROAD_COUNT);
-    if (row < ROAD_COUNT - 1) neighbours.push(current + ROAD_COUNT);
-    for (const next of neighbours) {
-      if (parent[next] === -1) {
-        parent[next] = current;
-        queue.push(next);
-      }
-    }
-  }
-  if (parent[goal.id] === -1) return [{ x: goal.x, y: goal.y }];
-
-  const path = [];
-  let node = goal.id;
-  while (node !== start.id) {
-    path.push(junctionById(node));
-    node = parent[node];
-  }
-  path.push(start);
-  path.reverse();
-  return path.map((j) => ({ x: j.x, y: j.y }));
+// District of a world point. North is houses, the west-centre is brick
+// Old Town, the middle is glass Downtown, the east is sandy Waterfront,
+// the south is industrial South Docks; the far east strip is beach.
+export function districtAt(x, y) {
+  if (x >= BEACH_EDGE_X) return 'beach';
+  if (y < 1100) return 'northside';
+  if (y >= 2100) return 'southdocks';
+  if (x >= 2500) return 'waterfront';
+  if (x >= 1300 && x < 2400) return 'downtown';
+  return 'oldtown';
 }
 
-// Distance along a route (sum of legs), for ETAs and chase logic.
-export function routeLength(waypoints) {
-  let total = 0;
-  for (let i = 1; i < waypoints.length; i++) {
-    total += Math.hypot(waypoints[i].x - waypoints[i - 1].x, waypoints[i].y - waypoints[i - 1].y);
-  }
-  return total;
-}
-
-// Building palettes per district kind.
-const BUILDING_STYLE = {
-  houses: { colors: ['#e8c9a0', '#d9b48a', '#cfa07a', '#e0d3b8'], heights: [26, 34, 42] },
-  brick: { colors: ['#a85f46', '#96604a', '#b06a4e', '#8f5340'], heights: [40, 56, 72] },
-  towers: { colors: ['#7fa8c9', '#6d9ab8', '#8fb4cc', '#5f8aa8'], heights: [90, 130, 170, 210] },
-  sand: { colors: ['#e6d9b8', '#dccfa8', '#efe3c2'], heights: [30, 44, 58] },
-  industrial: { colors: ['#8a8f96', '#7a7f88', '#9aa0a8', '#6f747c'], heights: [36, 52, 68] },
+export const DISTRICT_NAMES = {
+  northside: 'Northside',
+  oldtown: 'Old Town',
+  downtown: 'Downtown',
+  waterfront: 'Waterfront',
+  southdocks: 'South Docks',
+  beach: 'Beach',
 };
 
-// Fixed places the missions and systems need. Each sits on a road so a
-// driver can always reach it; the marker is the point the objective
-// banner points at.
+// Roof/base colours per district, warm coastal palette. The renderer
+// darkens the south and east sides from these and drops a blue-purple
+// shadow to the south-east (sun from the north-west).
+const DISTRICT_STYLES = {
+  northside: { colors: ['#c98f5f', '#b97a4e', '#d9a06b', '#a9714b'], height: [10, 18], kinds: ['house'] },
+  oldtown: { colors: ['#9c5a44', '#8a4a38', '#a96850', '#7d4030'], height: [16, 30], kinds: ['brick'] },
+  downtown: { colors: ['#7fa8c9', '#6b98bd', '#8fb4d4', '#5f8cad'], height: [34, 58], kinds: ['tower'] },
+  waterfront: { colors: ['#d9c08a', '#cbb27a', '#e0c996', '#bfa468'], height: [10, 22], kinds: ['house'] },
+  southdocks: { colors: ['#8a8f96', '#767b82', '#9aa0a8', '#6b7076'], height: [14, 26], kinds: ['shed'] },
+};
+
+// Named places the missions and the autopilot drive to. Every landmark
+// sits beside a road (never deep inside a block) so a car can reach it
+// by road plus one short straight final leg.
 export const LANDMARKS = {
-  market: { name: 'Market', x: 600, y: 600 },
-  downtown: { name: 'Downtown Drop', x: 2200, y: 1800 },
-  club: { name: 'Club Mirage', x: 1800, y: 2200 },
-  marina: { name: 'Marina', x: 3000, y: 1000 },
-  airport: { name: 'Crescent Airport', x: 600, y: 2600 },
-  hideout: { name: 'Hideout', x: 1000, y: 1400 },
-  docks: { name: 'South Docks', x: 1400, y: 3000 },
-  bank: { name: 'Bay Bank', x: 2200, y: 1400 },
-  gunStore: { name: 'Gun Store', x: 1000, y: 2200 },
-  fixerGarage: { name: 'Fixer Garage', x: 1400, y: 1800 },
-  sprayShop: { name: 'Spray Shop', x: 2600, y: 2200 },
-  pier: { name: 'Pier', x: 3120, y: 1400 },
+  market: { x: 600, y: 600, label: 'Market' },
+  downtown: { x: 1800, y: 1400, label: 'Downtown' },
+  club: { x: 2200, y: 600, label: 'Club' },
+  marina: { x: 2960, y: 2200, label: 'Marina' },
+  airport: { x: 600, y: 2900, label: 'Airport' },
+  hideout: { x: 1000, y: 2600, label: 'Hideout' },
+  fixerGarage: { x: 1400, y: 1800, label: 'Fixer Garage' },
+  sprayShop: { x: 1800, y: 2600, label: 'Spray Shop' },
+  gunStore: { x: 1000, y: 1000, label: 'Gun Store' },
+  docks: { x: 2600, y: 2600, label: 'Docks' },
+  bank: { x: 1800, y: 1800, label: 'Bank' },
+  plane: { x: 600, y: 3000, label: 'Plane' },
+  beach: { x: 3050, y: 1000, label: 'Beach' },
+  pier: { x: 3080, y: 1800, label: 'Pier' },
 };
 
-// Build the whole static city from the seeded stream. Returns the
-// buildings (with 2.5D heights and palettes), the pier, the lamp posts
-// along the roads, and the parked-car bays the traffic system fills.
-export function createWorld(seed) {
-  const rng = new SeededRandom(seed === undefined ? WORLD_SEED : seed);
+// Build the whole city from a seed. Buildings live inside blocks (never
+// on a road, never in the water); a few blocks are parks instead.
+export function createWorld(seed = WORLD_SEED) {
+  const rng = new Rng(seed);
   const buildings = [];
-  const lamps = [];
-  const parkedBays = [];
+  const parks = [];
+  const trees = [];
 
-  for (let bx = 0; bx < ROAD_COUNT - 1; bx++) {
-    for (let by = 0; by < ROAD_COUNT - 1; by++) {
-      const blockX0 = ROAD_LINES[bx] + ROAD_HALF + 16;
-      const blockY0 = ROAD_LINES[by] + ROAD_HALF + 16;
-      const blockX1 = ROAD_LINES[bx + 1] - ROAD_HALF - 16;
-      const blockY1 = ROAD_LINES[by + 1] - ROAD_HALF - 16;
-      const centreX = (blockX0 + blockX1) / 2;
-      const centreY = (blockY0 + blockY1) / 2;
-      const district = districtAt(centreX, centreY);
-      const style = BUILDING_STYLE[DISTRICTS[district].kind];
-
-      // The waterfront's eastern blocks are sand, not buildings.
-      if (district === 'waterfront' && bx >= 6) continue;
-
+  for (let bx = 0; bx < ROAD_COUNT - 1; bx += 1) {
+    for (let by = 0; by < ROAD_COUNT - 1; by += 1) {
+      const x0 = roadCoord(bx) + ROAD_HALF + SIDEWALK + 8;
+      const y0 = roadCoord(by) + ROAD_HALF + SIDEWALK + 8;
+      const x1 = roadCoord(bx + 1) - ROAD_HALF - SIDEWALK - 8;
+      const y1 = roadCoord(by + 1) - ROAD_HALF - SIDEWALK - 8;
+      const cx = (x0 + x1) / 2;
+      const cy = (y0 + y1) / 2;
+      // The far-east column is beach/water: no buildings there.
+      if (x0 >= BEACH_EDGE_X - 40) continue;
+      const district = districtAt(cx, cy);
+      // Roughly one block in nine is a park (never downtown's core).
+      if (district !== 'downtown' && rng.chance(0.11)) {
+        parks.push({ x: x0, y: y0, w: x1 - x0, h: y1 - y0, district });
+        for (let t = 0; t < 5; t += 1) {
+          trees.push({ x: rng.range(x0 + 20, x1 - 20), y: rng.range(y0 + 20, y1 - 20), r: rng.range(10, 18) });
+        }
+        continue;
+      }
+      const style = DISTRICT_STYLES[district] || DISTRICT_STYLES.oldtown;
       const count = district === 'downtown' ? rng.int(1, 2) : rng.int(1, 3);
-      for (let i = 0; i < count; i++) {
-        const w = rng.range(90, 190);
-        const h = rng.range(90, 190);
-        const x = rng.range(blockX0, Math.max(blockX0 + 1, blockX1 - w));
-        const y = rng.range(blockY0, Math.max(blockY0 + 1, blockY1 - h));
-        const height = rng.pick(style.heights) * rng.range(0.85, 1.15);
-        const color = rng.pick(style.colors);
+      for (let b = 0; b < count; b += 1) {
+        const w = district === 'downtown' ? rng.range(90, 150) : rng.range(70, 150);
+        const h = district === 'downtown' ? rng.range(90, 150) : rng.range(70, 140);
+        const px = rng.range(x0, Math.max(x0 + 1, x1 - w));
+        const py = rng.range(y0, Math.max(y0 + 1, y1 - h));
+        // Keep buildings inside one block from overlapping each other.
+        let overlaps = false;
+        for (const other of buildings) {
+          if (px < other.x + other.w + 12 && px + w + 12 > other.x && py < other.y + other.h + 12 && py + h + 12 > other.y) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (overlaps) continue;
         buildings.push({
-          x, y, w, h, height,
-          color,
+          x: px,
+          y: py,
+          w,
+          h,
+          height: rng.range(style.height[0], style.height[1]),
+          color: rng.pick(style.colors),
+          kind: rng.pick(style.kinds),
           district,
-          // Deterministic per-block shade so the same block always looks
-          // the same.
-          shade: hashCoords(bx * 7 + i, by * 7 + i),
         });
       }
-
-      // A parked-car bay on one side of most blocks.
-      if (rng.chance(0.7)) {
-        parkedBays.push({
-          x: blockX0 + rng.range(0, 60),
-          y: blockY1 - 8,
-          angle: 0,
-          district,
-        });
+      if (district !== 'downtown' && rng.chance(0.4)) {
+        trees.push({ x: rng.range(x0 + 16, x1 - 16), y: rng.range(y0 + 16, y1 - 16), r: rng.range(9, 15) });
       }
     }
   }
 
-  // Street lamps at every other junction corner.
-  for (let col = 0; col < ROAD_COUNT; col++) {
-    for (let row = 0; row < ROAD_COUNT; row++) {
-      if ((col + row) % 2 === 0) {
-        lamps.push({ x: ROAD_LINES[col] + ROAD_HALF + 10, y: ROAD_LINES[row] + ROAD_HALF + 10 });
-      }
+  // Marina and pier on the east edge: a wooden pier reaching into the
+  // water and a few moored boats. The pier itself is walkable ground.
+  const pier = { x: 3000, y: 1760, w: 150, h: 80 };
+  const boats = [];
+  for (let i = 0; i < 5; i += 1) {
+    boats.push({ x: rng.range(3100, 3180), y: 1500 + i * 110 + rng.range(-20, 20), angle: rng.range(-0.4, 0.4) });
+  }
+
+  // One street lamp per junction, offset to the corner, for the night
+  // light pools the renderer draws.
+  const lamps = [];
+  for (let col = 0; col < ROAD_COUNT; col += 1) {
+    for (let row = 0; row < ROAD_COUNT; row += 1) {
+      lamps.push({ x: roadCoord(col) + 44, y: roadCoord(row) + 44 });
     }
   }
 
-  // The pier reaches east from the marina road into the water.
-  const pier = {
-    x0: ROAD_LINES[7], y0: LANDMARKS.marina.y - 24,
-    x1: 3180, y1: LANDMARKS.marina.y + 24,
+  const world = {
+    size: WORLD_SIZE,
+    width: WORLD_SIZE,
+    height: WORLD_SIZE,
+    seed,
+    buildings,
+    parks,
+    trees,
+    lamps,
+    pier,
+    boats,
+    landmarks: LANDMARKS,
+    spawn: PLAYER_SPAWN,
   };
 
-  return { buildings, lamps, parkedBays, pier, seed: rng.seed };
+  // --- Collision helpers (bound to this world's buildings) ---
+
+  // True when the point is water (east of the water edge, off the pier).
+  world.isWater = function isWater(x, y) {
+    if (x < WATER_EDGE_X) return false;
+    if (x >= pier.x && x <= pier.x + pier.w && y >= pier.y && y <= pier.y + pier.h) return false;
+    return true;
+  };
+
+  // The building whose footprint contains (x, y), or null.
+  world.buildingAt = function buildingAt(x, y) {
+    for (const b of buildings) {
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
+    }
+    return null;
+  };
+
+  // True when (x, y) cannot be stood on: outside the map, in the water,
+  // or inside a building. pad grows the blocked area (use the mover's
+  // radius so bodies never sink into walls).
+  world.isBlocked = function isBlocked(x, y, pad = 0) {
+    if (x < 12 + pad || y < 12 + pad || x > WORLD_SIZE - 12 - pad || y > WORLD_SIZE - 12 - pad) return true;
+    if (world.isWater(x, y)) return true;
+    for (const b of buildings) {
+      if (x >= b.x - pad && x <= b.x + b.w + pad && y >= b.y - pad && y <= b.y + b.h + pad) return true;
+    }
+    return false;
+  };
+
+  // Move with wall sliding: try the full step, then x-only, then y-only.
+  // A mover sliding along a wall keeps going instead of sticking to it.
+  world.tryMove = function tryMove(x, y, dx, dy, radius = 12) {
+    if (!world.isBlocked(x + dx, y + dy, radius)) return { x: x + dx, y: y + dy, hitX: false, hitY: false };
+    const xOk = !world.isBlocked(x + dx, y, radius);
+    const yOk = !world.isBlocked(x, y + dy, radius);
+    return {
+      x: xOk ? x + dx : x,
+      y: yOk ? y + dy : y,
+      hitX: !xOk,
+      hitY: !yOk,
+    };
+  };
+
+  world.districtAt = districtAt;
+  world.nearestJunction = nearestJunction;
+  world.nearestRoadPoint = nearestRoadPoint;
+  world.findRoute = findRoute;
+  return world;
 }
 
-// --- Day / night ---------------------------------------------------------
-// The clock runs 0..24. 06:00-18:00 is day, 18:00-20:00 dusk, 20:00-06:00
-// night, 06:00-08:00 dawn. `daylight` is 1 at noon, 0 at midnight.
-
-export const DAY_LENGTH_SECONDS = 480; // one full day per 8 minutes
-
-export function daylightAt(hour) {
-  if (hour >= 6 && hour <= 18) {
-    const t = (hour - 6) / 12;
-    return Math.sin(t * Math.PI) * 0.85 + 0.15;
-  }
-  if (hour > 18 && hour < 20) return 0.15 * (1 - (hour - 18) / 2);
-  if (hour >= 4 && hour < 6) return 0.15 * ((hour - 4) / 2);
-  return 0;
-}
-
-export function isNight(hour) {
-  return daylightAt(hour) < 0.25;
-}
-
-export function timeLabel(hour) {
-  const h = Math.floor(hour) % 24;
-  const m = Math.floor((hour % 1) * 60);
-  const hh = String(h).padStart(2, '0');
-  const mm = String(m).padStart(2, '0');
-  return hh + ':' + mm;
-}
-
-// Traffic density factor by time of day: busier at midday, quieter at
-// night (spec section 3.6).
-export function trafficDensityAt(hour) {
-  if (hour >= 7 && hour <= 9) return 1.0;
-  if (hour >= 11 && hour <= 14) return 1.0;
-  if (hour >= 17 && hour <= 19) return 0.9;
-  if (hour >= 22 || hour < 5) return 0.35;
-  return 0.65;
-}
+// The shared world instance: built once at import from the fixed seed.
+// Modules that need their own copy (tests, screenshots) call createWorld.
+export const world = createWorld(WORLD_SEED);
+export default world;
