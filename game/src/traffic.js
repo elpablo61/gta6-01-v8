@@ -328,6 +328,18 @@ export function driveCarToward(car, tx, ty, cruise, dt, world, now = 0, opts = {
   if (!waypoint) return { arrived: true, rotating: false, distToWaypoint: 0, diff: 0 };
   let distToWaypoint = Math.hypot(waypoint.x - car.x, waypoint.y - car.y);
   while (waypoint && distToWaypoint < WAYPOINT_RADIUS) {
+    // The last waypoint is only the destination's nearest junction,
+    // not the destination itself. Popping it strands the car: the m2
+    // chase proved it — the player's route to the courier was a
+    // single junction 69 away while the courier sat 118 away, so
+    // driveCarToward reported "arrived" every frame and the car
+    // never moved (speed frozen at 200 for 130+ seconds, the
+    // autopilot's stuck-watch clearing a route that rebuilt the
+    // same way). Only pop the final waypoint once the car is also
+    // within radius of the real destination. A car in off-road
+    // recovery keeps the old rule: reaching its junction IS the
+    // recovery finishing, and the caller then assigns a fresh route.
+    if (!car.route[1] && !car.recover && Math.hypot(tx - car.x, ty - car.y) >= WAYPOINT_RADIUS) break;
     car.route.shift();
     waypoint = car.route[0];
     if (waypoint) distToWaypoint = Math.hypot(waypoint.x - car.x, waypoint.y - car.y);
@@ -399,7 +411,13 @@ export function driveCarToward(car, tx, ty, cruise, dt, world, now = 0, opts = {
 // route only when the target moves more than 100 from the route's
 // recorded destination — never every frame.
 export function followMovingTarget(car, target, cruise, dt, world, now = 0) {
-  return driveCarToward(car, target.x, target.y, cruise, dt, world, now, { finalLeg: false });
+  // A moving target's nearest junction is often the chaser's nearest
+  // junction too, so the route can be a single junction waypoint that
+  // pops while the target is still 100+ away. Close in, append the
+  // target's exact position as the final leg so the car closes on the
+  // target itself, not its junction.
+  const close = Math.hypot(target.x - car.x, target.y - car.y) < 600;
+  return driveCarToward(car, target.x, target.y, cruise, dt, world, now, { finalLeg: close });
 }
 
 function randomJunctionPoint() {

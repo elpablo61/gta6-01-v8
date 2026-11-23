@@ -1028,7 +1028,12 @@ function fallbackCourierStep(dt) {
   // dead end (the route builder handles that). Chase speed is the
   // autopilot's business; here the courier just keeps moving.
   const dest = courier.routeDest || { x: 600, y: 600 };
-  followMovingTarget(courier, { x: dest.x, y: dest.y }, 0, dt, game.world, game.now);
+  // Drive at the courier's own cruise (380, cut 55% per ram hit),
+  // not 0: with cruise 0 the courier could only creep while turning
+  // (the crawl rule) and stopped dead once aligned with its
+  // waypoint — the probe watched it sit 184 from its waypoint,
+  // speed 0, for 100+ seconds while the chase timed out.
+  followMovingTarget(courier, { x: dest.x, y: dest.y }, courier.cruise || 380, dt, game.world, game.now);
   if (!courier.route || !courier.route.length) {
     const spots = [600, 1400, 2200, 2600];
     const tx = spots[Math.floor(Math.random() * spots.length)];
