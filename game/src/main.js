@@ -544,9 +544,18 @@ function spawnCar(type, x, y, opts) {
     || VehiclesMod.createCar || VehiclesMod.createVehicle || null;
   let car = null;
   if (maker) {
-    try { car = maker(x, y, type, options); } catch (e) { car = null; }
+    // The factory takes (type, x, y, options). An earlier version
+    // passed (x, y, type, options) instead, so the courier was born
+    // with y='sedan': every distance from it came back NaN, the
+    // road-point lookup returned null, and the chase driver threw
+    // on the first m2 frame — killing the whole frame loop.
+    try { car = maker(type, x, y, options); } catch (e) { car = null; }
   }
-  if (!car) car = createCar(x, y, type, options);
+  // A maker that answers with non-numeric coordinates is discarded
+  // in favour of the known-good factory, whatever it did.
+  if (!car || typeof car.x !== 'number' || typeof car.y !== 'number') {
+    car = createCar(type, x, y, options);
+  }
   if (car && options.cruise !== undefined) car.cruise = options.cruise;
   if (car && options.isCourier) car.isCourier = true;
   if (car && options.courier) car.courier = true;

@@ -307,6 +307,10 @@ export function driveCarToward(car, tx, ty, cruise, dt, world, now = 0, opts = {
   if (!car.recover && !isOnRoad(car.x, car.y)) {
     car.recover = true;
     const roadPt = nearestRoadPoint(car.x, car.y);
+    // A car with a poisoned position (NaN) has no nearest road
+    // point; bailing out for this frame keeps one bad car from
+    // throwing and killing the whole frame loop.
+    if (!roadPt) return { arrived: false, rotating: false, distToWaypoint: 0, diff: 0 };
     const junction = nearestJunction(roadPt.x, roadPt.y);
     car.route = [roadPt, { x: junction.x, y: junction.y }];
     car.routeDest = { x: tx, y: ty };
