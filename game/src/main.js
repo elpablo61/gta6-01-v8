@@ -1069,9 +1069,23 @@ function fallbackCourierStep(dt) {
   // speed 0, for 100+ seconds while the chase timed out.
   followMovingTarget(courier, { x: dest.x, y: dest.y }, courier.cruise || 380, dt, game.world, game.now);
   if (!courier.route || !courier.route.length) {
+    // The courier flees to a NEARBY junction, not a random corner of
+    // the map: a cross-map flight forces the chaser into a long
+    // cross-city pursuit with a turn at every junction, and the probe
+    // watched Rook lose 1000+ units after a single ram hit while the
+    // courier crossed the map (1 hit in 150 s, m2 failed at 420 s in
+    // arc run 9 after passing in 6 s / 18 s in runs 7 / 8). Nearby
+    // legs keep the chase local, so the 55%-per-hit slowdown actually
+    // lets Rook close for the next hit; the courier still roams the
+    // whole city over time as a random walk.
     const spots = [600, 1400, 2200, 2600];
-    const tx = spots[Math.floor(Math.random() * spots.length)];
-    const ty = spots[Math.floor(Math.random() * spots.length)];
+    let tx = courier.x, ty = courier.y;
+    for (let tries = 0; tries < 8; tries++) {
+      const cx = spots[Math.floor(Math.random() * spots.length)];
+      const cy = spots[Math.floor(Math.random() * spots.length)];
+      if (Math.hypot(cx - courier.x, cy - courier.y) <= 1200) { tx = cx; ty = cy; break; }
+      if (tries === 7) { tx = cx; ty = cy; }
+    }
     courier.routeDest = { x: tx, y: ty };
   }
   // A ram hit counts within 70 while the player is faster than 120;
