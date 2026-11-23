@@ -828,14 +828,26 @@ export function createAutopilot(game) {
       return;
     }
     // In the zone: open the menu, buy the cheapest upgrade, close.
+    // All three happen in THIS frame: open() pauses the world, and a
+    // paused world never runs the autopilot again — returning after
+    // the open left the menu up forever with nobody able to buy or
+    // close it (the m11 probe watched it sit open 8+ s, world
+    // frozen, purchase never made).
     if (game && game.garage && typeof game.garage.open === 'function') {
       if (!game.garageOpen) {
         const opened = game.garage.open();
-        if (!opened) pressInteract();
-        return;
+        if (!opened) { pressInteract(); return; }
       }
       if (typeof game.garage.buyCheapestAvailable === 'function') {
-        const bought = game.garage.buyCheapestAvailable();
+        let bought = null;
+        try {
+          bought = game.garage.buyCheapestAvailable();
+        } catch (e) {
+          // A buy fault must never freeze the game with the menu open
+          // and the world paused: close up and let the mission fail
+          // cleanly on its timer instead.
+          bought = { ok: false, reason: 'buy error' };
+        }
         if (bought && bought.ok) {
           note('garage: bought ' + bought.id + ' for $' + bought.price);
           state.garageDone = true;
